@@ -30,13 +30,14 @@ class CHVAEModel(nn.Module):
 
         self.decoder = Decoder.Decoder(types_list, self.y_dim_partition, z_dim)
         self.prior_layer = nn.Linear(s_dim, z_dim)
+        self.prior_logvar = nn.Parameter(torch.zeros(1, z_dim))
 
     def forward(self, x_list, tau, x_list_c=None):
         normalized_data, normalization_params, noisy_data = Helpers.batch_normalization(x_list, self.types_list, len(x_list[0]))
         samples, q_params = self.encoder(noisy_data, tau, x_list_c)
         samples_s = samples['s']
         mean_pz = self.prior_layer(samples_s)
-        log_var_pz = torch.zeros_like(mean_pz)
+        log_var_pz = self.prior_logvar.expand_as(mean_pz)
         p_params = {'z': (mean_pz, log_var_pz)}
 
         theta, decoder_samples, gradient_decoder = self.decoder(samples['z'])

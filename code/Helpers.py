@@ -253,6 +253,11 @@ def error_computation(x_train, x_hat, types_dict):
 
 
 def place_holder_types(types_file, batch_size):
+    """
+    TensorFlow placeholders are no longer used. This helper now only returns the parsed
+    type metadata to preserve the original API surface for callers that expect the
+    function to exist.
+    """
     with open(types_file) as f:
         types_list = [{k: v for k, v in row.items()}
                       for row in csv.DictReader(f, skipinitialspace=True)]
@@ -262,8 +267,6 @@ def place_holder_types(types_file, batch_size):
 
 
 def batch_normalization(batch_data_list, types_list, batch_size):
-    import torch
-
     normalized_data = []
     normalization_parameters = []
     noisy_data = []

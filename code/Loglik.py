@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
 import Helpers
 from scipy.special import expit
+
+LOG_2PI = math.log(2 * math.pi)
 
 
 def loglik_real(batch_data, list_type, theta, normalization_params):
@@ -22,7 +25,7 @@ def loglik_real(batch_data, list_type, theta, normalization_params):
     est_var = data_var * est_var
 
     log_p_x = -0.5 * torch.sum((data - est_mean) ** 2 / est_var, dim=1) \
-              - int(list_type['dim']) * 0.5 * torch.log(torch.tensor(2 * np.pi, device=data.device)) \
+              - int(list_type['dim']) * 0.5 * LOG_2PI \
               - 0.5 * torch.sum(torch.log(est_var), dim=1)
 
     output['log_p_x'] = log_p_x

@@ -76,7 +76,7 @@ class ConditionalEncoder(BaseEncoder):
 
 
 def z_distribution_GMM(samples_s, z_dim):
-    mean_pz = nn.Linear(samples_s.shape[1], z_dim, bias=True)(samples_s)
-    log_var_pz = torch.zeros(samples_s.shape[0], z_dim, device=samples_s.device, dtype=samples_s.dtype)
+    mean_pz = torch.zeros(samples_s.shape[0], z_dim, device=samples_s.device, dtype=samples_s.dtype)
+    log_var_pz = torch.zeros_like(mean_pz)
     log_var_pz = torch.clamp(log_var_pz, -15.0, 15.0)
     return mean_pz, log_var_pz

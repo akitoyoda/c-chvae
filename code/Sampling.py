@@ -7,7 +7,7 @@ from sklearn.preprocessing import StandardScaler
 import Helpers
 import Evaluation
 import Graph
-import Decoder
+from Decoder import decoder_test_time
 
 
 np.random.seed(619)
@@ -59,8 +59,8 @@ def sampling(settings, types_dict, types_dict_c, out, ncounterfactuals, clf, n_b
             batch_np = Helpers.next_batch(train_data_aux, types_dict, args.batch_size, index_batch=i)
             batch_np_c = Helpers.next_batch(train_data_aux_c, types_dict_c, args.batch_size, index_batch=i)
 
-            batch = torch.tensor(np.concatenate(batch_np, axis=1), dtype=torch.float32, device=device)
-            batch_c = torch.tensor(np.concatenate(batch_np_c, axis=1), dtype=torch.float32, device=device)
+            batch = torch.from_numpy(np.concatenate(batch_np, axis=1)).to(device=device, dtype=torch.float32)
+            batch_c = torch.from_numpy(np.concatenate(batch_np_c, axis=1)).to(device=device, dtype=torch.float32)
 
             x_list = _split_tensor(batch, types_dict)
             x_list_c = _split_tensor(batch_c, types_dict_c)
@@ -154,7 +154,7 @@ def sampling(settings, types_dict, types_dict_c, out, ncounterfactuals, clf, n_b
             z_tilde = replicated_z + delta_z
 
             z_tilde_tensor = torch.tensor(z_tilde, dtype=torch.float32, device=device)
-            theta_perturbed, _ = Decoder.decoder_test_time(model.decoder, z_tilde_tensor)
+            theta_perturbed, _ = decoder_test_time(model.decoder, z_tilde_tensor)
             theta_np = []
             for t in theta_perturbed:
                 if isinstance(t, list):

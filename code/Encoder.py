@@ -1,212 +1,82 @@
-
-import tensorflow as tf
-
-def encoder(X_list, batch_size, z_dim, s_dim, tau):
-
-    samples = dict.fromkeys(['s', 'z', 'y', 'x'], [])
-    q_params = dict()
-    X = tf.concat(X_list, 1)
-
-    # Create the proposal of q(s|x^o): categorical(x^~)
-    samples['s'], q_params['s'] = s_proposal_multinomial(X, batch_size, s_dim, tau, reuse=None)
-
-    # Create the proposal of q(z|s,x^o): N(mu(x^~,s), SIGMA(x^~,s))???
-    samples['z'], q_params['z'] = z_proposal_GMM_factorized(X_list, samples['s'], batch_size, z_dim, reuse=None)
-
-    return samples, q_params
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-def encoder_c(X_list, X_list_c, batch_size, z_dim, s_dim, tau):
+class BaseEncoder(nn.Module):
+    def __init__(self, input_dims, z_dim, s_dim, include_condition=False, condition_dim=0):
+        super().__init__()
+        self.z_dim = z_dim
+        self.s_dim = s_dim
+        self.include_condition = include_condition
+        self.condition_dim = condition_dim
 
-    samples = dict.fromkeys(['s', 'z', 'y', 'x'], [])
-    q_params = dict()
-    X = tf.concat(X_list, 1)
-    X_c = tf.concat(X_list_c, 1)
+        total_dim = sum(input_dims) + (condition_dim if include_condition else 0)
+        self.s_layer = nn.Linear(total_dim, s_dim)
 
-    # Create the proposal of q(s|x^o): categorical(x^~)
-    samples['s'], q_params['s'] = s_proposal_multinomial_c(X, X_c, batch_size, s_dim, tau, reuse=None)
+        self.z_mean_layers = nn.ModuleList()
+        self.z_logvar_layers = nn.ModuleList()
+        for dim in input_dims:
+            in_dim = dim + s_dim + (condition_dim if include_condition else 0)
+            self.z_mean_layers.append(nn.Linear(in_dim, z_dim))
+            self.z_logvar_layers.append(nn.Linear(in_dim, z_dim))
 
-    # Create the proposal of q(z|s,x^o): N(mu(x^~,s), SIGMA(x^~,s))???
-    samples['z'], q_params['z'] = z_proposal_GMM_factorized_c(X_list, X_c, samples['s'], batch_size, z_dim, reuse=None)
+    def forward(self, x_list, tau, x_cond_list=None):
+        device = x_list[0].device
+        batch_size = x_list[0].shape[0]
 
-    return samples, q_params
+        x = torch.cat(x_list, dim=1)
+        if self.include_condition and x_cond_list is not None:
+            x_cond = torch.cat(x_cond_list, dim=1)
+            x = torch.cat([x, x_cond], dim=1)
+        else:
+            x_cond = None
 
+        log_pi = self.s_layer(x)
+        samples_s = F.gumbel_softmax(log_pi, tau=tau, hard=False, dim=1)
 
-def encoder_vae(X_list, X_list_c, batch_size, z_dim, s_dim, tau):
+        mean_qz = []
+        log_var_qz = []
+        for idx, d in enumerate(x_list):
+            pieces = [d, samples_s]
+            if self.include_condition and x_cond is not None:
+                pieces.append(x_cond)
+            inp = torch.cat(pieces, dim=1)
+            mean_qz.append(self.z_mean_layers[idx](inp))
+            log_var_qz.append(self.z_logvar_layers[idx](inp))
 
-    samples = dict.fromkeys(['s', 'z', 'y', 'x'], [])
-    q_params = dict()
-    X = tf.concat(X_list, 1)
-    X_c = tf.concat(X_list_c, 1)
+        prior_log_var = torch.zeros(batch_size, self.z_dim, device=device, dtype=x.dtype)
+        prior_mean = torch.zeros_like(prior_log_var)
+        log_var_qz.append(prior_log_var)
+        mean_qz.append(prior_mean)
 
-    # Create the proposal of q(s|x^o): categorical(x^~)
-    samples['s'], q_params['s'] = s_proposal_multinomial_c(X, X_c, batch_size, s_dim, tau, reuse=None)
+        log_var_stack = torch.stack(log_var_qz, dim=0)
+        mean_stack = torch.stack(mean_qz, dim=0)
 
-    # Create the proposal of q(z|s,x^o): N(mu(x^~,s), SIGMA(x^~,s))???
-    samples['z'], q_params['z'] = z_proposal_GMM_factorized_c(X_list, X_c, samples['s'], batch_size, z_dim, reuse=None)
+        log_var_joint = -torch.logsumexp(-log_var_stack, dim=0)
+        mean_joint = torch.exp(log_var_joint) * torch.sum(mean_stack * torch.exp(-log_var_stack), dim=0)
 
-    return samples, q_params
+        eps = torch.randn_like(mean_joint)
+        samples_z = mean_joint + torch.exp(0.5 * log_var_joint) * eps
 
+        samples = {'s': samples_s, 'z': samples_z, 'y': None, 'x': None}
+        q_params = {'s': log_pi, 'z': (mean_joint, log_var_joint)}
 
-
-def z_proposal_GMM_factorized(X, samples_s, batch_size, z_dim, reuse):
-    mean_qz = []
-    log_var_qz = []
-
-    for i, d in enumerate(X):
-        observed_data = d
-        observed_s = samples_s
-
-        # Mean layer
-        aux_m_qz = tf.layers.dense(inputs=tf.concat([observed_data, observed_s], 1), units=z_dim, activation=None,
-                                   kernel_initializer=tf.random_normal_initializer(stddev=0.05),
-                                   name='layer_1_' + 'mean_enc_z' + str(i), reuse=reuse)
-
-
-        # Logvar layers
-        aux_lv_qz = tf.layers.dense(inputs=tf.concat([observed_data, observed_s], 1), units=z_dim, activation=None,
-                                    kernel_initializer=tf.random_normal_initializer(stddev=0.05),
-                                    name='layer_1_' + 'logvar_enc_z' + str(i), reuse=reuse)
-
-        mean_qz.append(aux_m_qz)
-        log_var_qz.append(aux_lv_qz)
-
-        # Input prior
-    log_var_qz.append(tf.zeros([batch_size, z_dim]))
-    mean_qz.append(tf.zeros([batch_size, z_dim]))
-
-    # Compute full parameters, as a product of Gaussians distribution
-    log_var_qz_joint = -tf.reduce_logsumexp(tf.negative(log_var_qz), 0)
-    mean_qz_joint = tf.multiply(tf.exp(log_var_qz_joint),
-                                tf.reduce_sum(tf.multiply(mean_qz, tf.exp(tf.negative(log_var_qz))), 0))
-
-    # Avoid numerical problems
-    # log_var_qz = tf.clip_by_value(log_var_qz, -15.0, 15.0)
-    # Rep-trick
-    eps = tf.random_normal((batch_size, z_dim), 0, 1, dtype=tf.float32)
-    samples_z = mean_qz_joint + tf.multiply(tf.exp(log_var_qz_joint / 2), eps)
-
-    return samples_z, [mean_qz_joint, log_var_qz_joint]
+        return samples, q_params
 
 
-def z_proposal_GMM_factorized_c(X, X_c, samples_s, batch_size, z_dim, reuse):
-    mean_qz = []
-    log_var_qz = []
-
-    for i, d in enumerate(X):
-        observed_data = d
-        observed_s = samples_s
-
-        # Mean layer
-        aux_m_qz = tf.layers.dense(inputs=tf.concat([observed_data, observed_s, X_c], 1), units=z_dim, activation=None,
-                                   kernel_initializer=tf.random_normal_initializer(stddev=0.05),
-                                   name='layer_1_' + 'mean_enc_z' + str(i), reuse=reuse)
-
-        # Logvar layers
-        aux_lv_qz = tf.layers.dense(inputs=tf.concat([observed_data, observed_s, X_c], 1), units=z_dim, activation=None,
-                                    kernel_initializer=tf.random_normal_initializer(stddev=0.05),
-                                    name='layer_1_' + 'logvar_enc_z' + str(i), reuse=reuse)
-
-        mean_qz.append(aux_m_qz)
-        log_var_qz.append(aux_lv_qz)
-
-    # Input prior
-    log_var_qz.append(tf.zeros([batch_size, z_dim]))
-    mean_qz.append(tf.zeros([batch_size, z_dim]))
-
-    # Compute full parameters, as a product of Gaussians distribution
-    log_var_qz_joint = -tf.reduce_logsumexp(tf.negative(log_var_qz), 0)
-    mean_qz_joint = tf.multiply(tf.exp(log_var_qz_joint),
-                                tf.reduce_sum(tf.multiply(mean_qz, tf.exp(tf.negative(log_var_qz))), 0))
-
-    # Avoid numerical problems
-    # log_var_qz = tf.clip_by_value(log_var_qz, -15.0, 15.0)
-    # Rep-trick
-    eps = tf.random_normal((batch_size, z_dim), 0, 1, dtype=tf.float32)
-    samples_z = mean_qz_joint + tf.multiply(tf.exp(log_var_qz_joint / 2), eps)
-
-    return samples_z, [mean_qz_joint, log_var_qz_joint]
+class Encoder(BaseEncoder):
+    def __init__(self, input_dims, z_dim, s_dim):
+        super().__init__(input_dims, z_dim, s_dim, include_condition=False)
 
 
-def z_proposal_distribution_GMM(x_list, x_list_c, samples_s, z_dim, reuse):
-    # We propose a GMM for z
+class ConditionalEncoder(BaseEncoder):
+    def __init__(self, input_dims, condition_dims, z_dim, s_dim):
+        super().__init__(input_dims, z_dim, s_dim, include_condition=True, condition_dim=sum(condition_dims))
 
-    x = tf.concat(x_list, 1)
-    x_c = tf.concat(x_list_c, 1)
 
-    h1 = tf.layers.dense(inputs=tf.concat([x, samples_s, x_c], 1), units=z_dim, activation=tf.nn.relu,
-                              kernel_initializer=tf.random_normal_initializer(stddev=0.05),
-                              name='layer_1_enc', reuse=reuse)
-
-    # Mean layer
-    aux_m_qz = tf.layers.dense(inputs=h1, units=z_dim, activation=None,
-                               kernel_initializer=tf.random_normal_initializer(stddev=0.05),
-                               name='layer_2_' + 'mean_enc_z', reuse=reuse)
-
-    # Logvar layers
-    aux_lv_qz = tf.layers.dense(inputs=h1, units=z_dim, activation=None,
-                                kernel_initializer=tf.random_normal_initializer(stddev=0.05),
-                                name='layer_2_' + 'logvar_enc_z', reuse=reuse)
-
-    # Input prior
-
-    log_var_qz.append(tf.zeros([batch_size, z_dim]))
-    mean_qz.append(tf.zeros([batch_size, z_dim]))
-
-    # Compute full parameters, as a product of Gaussians distribution
-    log_var_qz_joint = -tf.reduce_logsumexp(tf.negative(log_var_qz), 0)
-    mean_qz_joint = tf.multiply(tf.exp(log_var_qz_joint),tf.reduce_sum(tf.multiply(mean_qz, tf.exp(tf.negative(log_var_qz))), 0))
-
-    # Avoid numerical problems
-    # log_var_qz = tf.clip_by_value(log_var_qz, -15.0, 15.0)
-    # Rep-trick
-    eps = tf.random_normal((batch_size, z_dim), 0, 1, dtype=tf.float32)
-    samples_z = mean_qz_joint + tf.multiply(tf.exp(log_var_qz_joint / 2), eps)
-
+def z_distribution_GMM(samples_s, z_dim):
+    mean_pz = torch.zeros(samples_s.shape[0], z_dim, device=samples_s.device, dtype=samples_s.dtype)
+    log_var_pz = torch.zeros_like(mean_pz)
+    log_var_pz = torch.clamp(log_var_pz, -15.0, 15.0)
     return mean_pz, log_var_pz
-
-
-
-
-def s_proposal_multinomial(X, batch_size, s_dim, tau, reuse):
-    # Categorical(\pi(x^~))
-    # We propose a categorical distribution to create a GMM for the latent space z
-    log_pi = tf.layers.dense(inputs=X, units=s_dim, activation=None,
-                             kernel_initializer=tf.random_normal_initializer(stddev=0.05), name='layer_1_' + 'enc_s',
-                             reuse=reuse)
-
-    # Gumbel-softmax trick (tau is temperature parameter)
-    U = -tf.log(-tf.log(tf.random_uniform([batch_size, s_dim])))
-    samples_s = tf.nn.softmax((log_pi + U) / tau)
-
-    return samples_s, log_pi
-
-
-def s_proposal_multinomial_c(X, X_c, batch_size, s_dim, tau, reuse):
-    # Categorical(\pi(x^~))
-    # We propose a categorical distribution to create a GMM for the latent space z
-    log_pi = tf.layers.dense(inputs=tf.concat([X, X_c], 1), units=s_dim, activation=None,
-                             kernel_initializer=tf.random_normal_initializer(stddev=0.05), name='layer_1_' + 'enc_s',
-                             reuse=reuse)
-
-    # Gumbel-softmax trick (tau is temperature parameter)
-    U = -tf.log(-tf.log(tf.random_uniform([batch_size, s_dim])))
-    samples_s = tf.nn.softmax((log_pi + U) / tau)
-
-    return samples_s, log_pi
-
-
-
-def z_distribution_GMM(samples_s, z_dim, reuse):
-    # We propose a GMM for z
-    mean_pz = tf.layers.dense(inputs=samples_s, units=z_dim, activation=None,
-                              kernel_initializer=tf.random_normal_initializer(stddev=0.05),
-                              name='layer_1_' + 'mean_dec_z', reuse=reuse)
-
-    log_var_pz = tf.zeros([tf.shape(samples_s)[0], z_dim])
-
-    # Avoid numerical problems
-    log_var_pz = tf.clip_by_value(log_var_pz, -15.0, 15.0)
-
-    return mean_pz, log_var_pz
-

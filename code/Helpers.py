@@ -1,6 +1,6 @@
 
-import tensorflow as tf
 import numpy as np
+import torch
 from sklearn.metrics import mean_squared_error
 from sklearn import preprocessing
 from sklearn.model_selection import train_test_split
@@ -253,17 +253,16 @@ def error_computation(x_train, x_hat, types_dict):
 
 
 def place_holder_types(types_file, batch_size):
-    # Read the types of the data from the files
+    """
+    TensorFlow placeholders are no longer used. This helper now only returns the parsed
+    type metadata to preserve the original API surface for callers that expect the
+    function to exist.
+    """
     with open(types_file) as f:
         types_list = [{k: v for k, v in row.items()}
                       for row in csv.DictReader(f, skipinitialspace=True)]
-
-    # Create placeholders for every data type, with appropriate dimensions
-    batch_data_list = []
-    for i in range(len(types_list)):
-        batch_data_list.append(tf.placeholder(tf.float32, shape=(None, types_list[i]['dim'])))
-    tf.concat(batch_data_list, axis=1)
-
+    # This function now only returns the list of types for compatibility
+    batch_data_list = [None for _ in types_list]
     return batch_data_list, types_list
 
 
@@ -273,56 +272,44 @@ def batch_normalization(batch_data_list, types_list, batch_size):
     noisy_data = []
 
     for i, d in enumerate(batch_data_list):
-
         observed_data = d
 
         if types_list[i]['type'] == 'real':
-            # We transform the data to a gaussian with mean 0 and std 1
-            data_mean, data_var = tf.nn.moments(observed_data, 0)
-            data_var = tf.clip_by_value(data_var, 1e-6, 1e20)  # Avoid zero values
-            aux_X = tf.nn.batch_normalization(observed_data, data_mean, data_var, offset=0.0, scale=1.0,
-                                              variance_epsilon=1e-6)
-
-            aux_X_noisy = aux_X + tf.random_normal((batch_size, 1), 0, 0.05, dtype=tf.float32)
+            data_mean = torch.mean(observed_data, dim=0)
+            data_var = torch.var(observed_data, dim=0, unbiased=False).clamp(min=1e-6)
+            aux_X = (observed_data - data_mean) / torch.sqrt(data_var)
+            aux_X_noisy = aux_X + torch.randn(batch_size, observed_data.shape[1], device=observed_data.device) * 0.05
 
             normalized_data.append(aux_X)
             noisy_data.append(aux_X_noisy)
             normalization_parameters.append([data_mean, data_var])
 
-        # When using log-normal
         elif types_list[i]['type'] == 'pos':
-
-            # We transform the log of the data to a gaussian with mean 0 and std 1
-            observed_data_log = tf.log(1 + observed_data)
-            data_mean_log, data_var_log = tf.nn.moments(observed_data_log, 0)
-            data_var_log = tf.clip_by_value(data_var_log, 1e-6, 1e20)  # Avoid zero values
-            aux_X = tf.nn.batch_normalization(observed_data_log, data_mean_log, data_var_log, offset=0.0, scale=1.0,
-                                              variance_epsilon=1e-6)
+            observed_data_log = torch.log1p(observed_data)
+            data_mean_log = torch.mean(observed_data_log, dim=0)
+            data_var_log = torch.var(observed_data_log, dim=0, unbiased=False).clamp(min=1e-6)
+            aux_X = (observed_data_log - data_mean_log) / torch.sqrt(data_var_log)
 
             normalized_data.append(aux_X)
             normalization_parameters.append([data_mean_log, data_var_log])
+            noisy_data.append(aux_X)
 
         elif types_list[i]['type'] == 'count':
-
-            # We transform the log of the data to a gaussian with mean 0 and std 1
-            observed_data_log = tf.log(1 + observed_data)
-            data_mean_log, data_var_log = tf.nn.moments(observed_data_log, 0)
-            data_var_log = tf.clip_by_value(data_var_log, 1e-6, 1e20)  # Avoid zero values
-            aux_X = tf.nn.batch_normalization(observed_data_log, data_mean_log, data_var_log, offset=0.0, scale=1.0,
-                                              variance_epsilon=1e-6)
+            observed_data_log = torch.log1p(observed_data)
+            data_mean_log = torch.mean(observed_data_log, dim=0)
+            data_var_log = torch.var(observed_data_log, dim=0, unbiased=False).clamp(min=1e-6)
+            aux_X = (observed_data_log - data_mean_log) / torch.sqrt(data_var_log)
 
             normalized_data.append(aux_X)
             normalization_parameters.append([data_mean_log, data_var_log])
-
+            noisy_data.append(aux_X)
 
         else:
-            # Don't normalize the categorical and ordinal variables
-            normalized_data.append(d)
-            normalization_parameters.append(tf.convert_to_tensor([0.0, 1.0], dtype=tf.float32))  # No normalization here
-
-            aux_X_noisy = d + tf.random_normal((batch_size, 1), 0, 0.05, dtype=tf.float32)
+            normalized_data.append(observed_data)
+            normalization_parameters.append([torch.tensor(0.0, device=observed_data.device),
+                                             torch.tensor(1.0, device=observed_data.device)])
+            aux_X_noisy = observed_data + torch.randn(batch_size, observed_data.shape[1], device=observed_data.device) * 0.05
             noisy_data.append(aux_X_noisy)
-
 
     return normalized_data, normalization_parameters, noisy_data
 

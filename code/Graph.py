@@ -1,275 +1,93 @@
-
-import tensorflow as tf
 import numpy as np
+import torch
+import torch.nn as nn
 import Helpers
 import Encoder
 import Decoder
 import Evaluation
-import Generator
-
-# MASTER of Disaster
-
-def C_HVAE_graph(types_file, learning_rate=1e-4, z_dim=1, y_dim=1, s_dim=1, y_dim_partition=[], nsamples=1000, p=2):
-
-    # -----------------------------------------------------------------------------------#
-    # Preliminaries
-
-    # Load remaining placeholders
-    print('[*] Defining placeholders')
 
 
-    # Placeholder for batch_size (required for counterfactual search loop)
-    batch_size = tf.placeholder(dtype=tf.int32)
-    # Placeholder for Gumbel-softmax parameter
-    tau = tf.placeholder(tf.float32, shape=())
-    batch_data_list, types_list = Helpers.place_holder_types(types_file, batch_size)
+class CHVAEModel(nn.Module):
+    def __init__(self, types_list, types_list_c=None, z_dim=1, y_dim=1, s_dim=1, y_dim_partition=None):
+        super().__init__()
+        self.types_list = types_list
+        self.types_list_c = types_list_c
+        self.z_dim = z_dim
+        self.y_dim = y_dim
+        self.s_dim = s_dim
 
-    # Batch normalization of the data
-    X_list, normalization_params, X_list_noisy = Helpers.batch_normalization(batch_data_list, types_list, batch_size)
+        if y_dim_partition:
+            self.y_dim_partition = y_dim_partition
+        else:
+            self.y_dim_partition = list(y_dim * np.ones(len(types_list), dtype=int))
 
+        input_dims = [int(t['dim']) for t in types_list]
+        if types_list_c:
+            cond_dims = [int(t['dim']) for t in types_list_c]
+            self.encoder = Encoder.ConditionalEncoder(input_dims, cond_dims, z_dim, s_dim)
+        else:
+            self.encoder = Encoder.Encoder(input_dims, z_dim, s_dim)
 
-    # Set dimensionality of Y
-    if y_dim_partition:
-        y_dim_output = np.sum(y_dim_partition)
-    else:
-        y_dim_partition = y_dim * np.ones(len(types_list), dtype=int)
-        y_dim_output = np.sum(y_dim_partition)
+        self.decoder = Decoder.Decoder(types_list, self.y_dim_partition, z_dim)
+        self.prior_layer = nn.Linear(s_dim, z_dim)
+        self.prior_logvar = nn.Parameter(torch.zeros(1, z_dim))
 
-    # -----------------------------------------------------------------------------------#
-    # (HVAE) Encoder and Decoder for training time
+    def forward(self, x_list, tau, x_list_c=None):
+        normalized_data, normalization_params, noisy_data = Helpers.batch_normalization(x_list, self.types_list, len(x_list[0]))
+        samples, q_params = self.encoder(noisy_data, tau, x_list_c)
+        samples_s = samples['s']
+        mean_pz = self.prior_layer(samples_s)
+        log_var_pz = self.prior_logvar.expand_as(mean_pz)
+        p_params = {'z': (mean_pz, log_var_pz)}
 
-    # Encoder
-    print('[*] Defining Encoder...')
-    samples, q_params = Encoder.encoder(X_list_noisy, batch_size, z_dim, s_dim, tau)
+        theta, decoder_samples, gradient_decoder = self.decoder(samples['z'])
+        decoder_samples['s'] = samples_s
 
-    samples_s = samples['s']
-    samples_z = samples['z']
-    p_params = dict()
+        log_p_x, samples_x, params_x = Evaluation.loglik_evaluation(normalized_data, self.types_list, theta, normalization_params)
+        p_params['x'] = params_x
 
-    # Create the distribution of p(z|s)
-    p_params['z'] = Encoder.z_distribution_GMM(samples['s'], z_dim, reuse=None)
+        ELBO, loss_reconstruction, KL_z, KL_s = Evaluation.cost_function(
+            log_p_x, p_params, q_params, self.types_list, self.z_dim, np.sum(self.y_dim_partition), self.s_dim)
 
-    # Decoder
-    print('[*] Defining Decoder...')
-    theta, samples, gradient_decoder = Decoder.decoder(samples_z, z_dim, y_dim_output, y_dim_partition, batch_size, types_list)
+        outputs = {
+            'samples': decoder_samples,
+            'q_params': q_params,
+            'p_params': p_params,
+            'log_p_x': log_p_x,
+            'loss_reconstruction': loss_reconstruction,
+            'ELBO': ELBO,
+            'KL_z': KL_z,
+            'KL_s': KL_s,
+            'theta': theta,
+            'normalization_params': normalization_params
+        }
+        return outputs
 
-    samples['s'] = samples_s
-    # Compute loglik and output of the VAE
-    log_p_x, samples['x'], p_params['x'] = Evaluation.loglik_evaluation(batch_data_list,
-                                                             types_list,
-                                                             theta,
-                                                             normalization_params,
-                                                             reuse=None)
-
-    # Evaluate active vs passive variables
-    degree_active = 0.95# must be less than 1 (not used in paper)
-    delta_kl = Evaluation.kl_z_diff(p_params, q_params, degree_active, batch_size, z_dim)
-
-
-    # -----------------------------------------------------------------------------------#
-    # optimize ELBO
-
-    print('[*] Defining Cost function...')
-    ELBO, loss_reconstruction, KL_z, KL_s = Evaluation.cost_function(log_p_x,
-                                                          p_params,
-                                                          q_params,
-                                                          types_list,
-                                                          z_dim,
-                                                          y_dim_output,
-                                                          s_dim)
-
-    optim = tf.train.AdamOptimizer(learning_rate).minimize(-ELBO)
-
-    # -----------------------------------------------------------------------------------#
-    # Generator function for test time sample generation
-    samples_test, test_params, log_p_x_test, theta_test = Generator.samples_generator(batch_data_list,
-                                                                            X_list,
-                                                                            types_list,
-                                                                            batch_size,
-                                                                            z_dim,
-                                                                            y_dim_output,
-                                                                            y_dim_partition,
-                                                                            s_dim,
-                                                                            tau,
-                                                                            normalization_params)
-
-    # -----------------------------------------------------------------------------------#
-    #  Decoder for test time counterfactuals
-    #  'samples_perturbed': does not contain 'x' samples
-
-    print('[*] Defining Test Time Decoder...')
-    theta_perturbed, samples_perturbed = Decoder.decoder_test_time(samples_z,
-                                                            z_dim,
-                                                            y_dim_output,
-                                                            y_dim_partition,
-                                                            batch_size,
-                                                            types_list)
-
-    # Evaluation Function not necessary here
-    '''log_p_x, samples_perturbed['x'], p_params_x_perturbed = Evaluation.loglik_evaluation(batch_data_list,
-                                                                              types_list,
-                                                                              theta_perturbed,
-                                                                              normalization_params,
-                                                                              reuse=True)'''
-
-    # -----------------------------------------------------------------------------------#
-    # Packing results
-
-    tf_nodes = {'batch_size': batch_size,#feed
-                'ground_batch': batch_data_list,#feed
-                'tau_GS': tau,#feed,
-                #'predict_proba': predict_proba,#feed
-                'samples_z': samples_z,#feed
-                'samples': samples,
-                'log_p_x': log_p_x,
-                'loss_re': loss_reconstruction,
-                'loss': -ELBO,
-                'optim': optim,
-                'KL_s': KL_s,
-                'KL_z': KL_z,
-                'X': X_list,
-                'p_params': p_params,
-                'q_params': q_params,
-                'samples_test': samples_test,
-                'test_params': test_params,
-                'log_p_x_test': log_p_x_test,
-                'samples_perturbed': samples_perturbed,
-                'theta_test': theta_test,
-                'theta_perturbed': theta_perturbed,
-                'normalization_params': normalization_params,
-                'gradient_decoder': gradient_decoder,
-                'delta_kl': delta_kl}
-
-    return tf_nodes
+    @torch.no_grad()
+    def generate(self, x_list, tau=1e-3, x_list_c=None):
+        self.eval()
+        normalized_data, normalization_params, noisy_data = Helpers.batch_normalization(x_list, self.types_list, len(x_list[0]))
+        samples, q_params = self.encoder(noisy_data, tau, x_list_c)
+        theta, decoder_samples = self.decoder.decode_only(samples['z'])
+        log_p_x, samples_x, params_x = Evaluation.loglik_evaluation(normalized_data, self.types_list, theta, normalization_params)
+        return {
+            'samples': {**decoder_samples, 's': samples['s'], 'x': samples_x},
+            'q_params': q_params,
+            'theta': theta,
+            'log_p_x': log_p_x,
+            'params_x': params_x,
+            'normalization_params': normalization_params
+        }
 
 
-# MASTER of Disaster for conditional density approximations
-
-def C_CHVAE_graph(types_file, types_file_c, learning_rate=1e-3, z_dim=1, y_dim=1, s_dim=1, y_dim_partition=[], nsamples=1000, p=2, degree_active=0.95):
-
-    # -----------------------------------------------------------------------------------#
-    # Preliminaries
-
-    # Load placeholders
-    print('[*] Defining placeholders')
-
-    # c: short for 'conditional'
-    # Placeholder for batch_size (required for counterfactual search loop)
-    batch_size = tf.placeholder(dtype=tf.int32)
-    # Placeholder for Gumbel-softmax parameter
-    tau = tf.placeholder(tf.float32, shape=())
-    batch_data_list, types_list = Helpers.place_holder_types(types_file, batch_size)
-    batch_data_list_c, types_list_c = Helpers.place_holder_types(types_file_c, batch_size)
+def C_HVAE_graph(types_file, learning_rate=1e-4, z_dim=1, y_dim=1, s_dim=1, y_dim_partition=None, nsamples=1000, p=2):
+    _, types_list = Helpers.place_holder_types(types_file, None)
+    model = CHVAEModel(types_list, None, z_dim, y_dim, s_dim, y_dim_partition)
+    return model
 
 
-    # Batch normalization of the data
-    X_list, normalization_params, X_list_noisy = Helpers.batch_normalization(batch_data_list, types_list, batch_size)
-    # Batch normalization of the data
-    X_list_c, _, X_list_noisy_c = Helpers.batch_normalization(batch_data_list_c, types_list, batch_size)
-
-
-    # Set dimensionality of Y
-    if y_dim_partition:
-        y_dim_output = np.sum(y_dim_partition)
-    else:
-        y_dim_partition = y_dim * np.ones(len(types_list), dtype=int)
-        y_dim_output = np.sum(y_dim_partition)
-
-    # -----------------------------------------------------------------------------------#
-    # (HVAE) Encoder and Decoder for training time
-
-    # Encoder
-    print('[*] Defining Encoder...')
-    samples, q_params = Encoder.encoder_c(X_list, X_list_c, batch_size, z_dim, s_dim, tau)
-
-    samples_s = samples['s']
-    samples_z = samples['z']
-    p_params = dict()
-
-    # Create the distribution of p(z|s)
-    p_params['z'] = Encoder.z_distribution_GMM(samples['s'], z_dim, reuse=None)
-
-    # Decoder
-    print('[*] Defining Decoder...')
-    theta, samples, gradient_decoder = Decoder.decoder(samples_z, z_dim, y_dim_output, y_dim_partition, batch_size, types_list)
-
-    samples['s'] = samples_s
-    # Compute loglik and output of the VAE
-    log_p_x, samples['x'], p_params['x'] = Evaluation.loglik_evaluation(batch_data_list,
-                                                             types_list,
-                                                             theta,
-                                                             normalization_params,
-                                                             reuse=None)
-
-    # -----------------------------------------------------------------------------------#
-    # optimize ELBO
-
-    print('[*] Defining Cost function...')
-    ELBO, loss_reconstruction, KL_z, KL_s = Evaluation.cost_function(log_p_x,
-                                                          p_params,
-                                                          q_params,
-                                                          types_list,
-                                                          z_dim,
-                                                          y_dim_output,
-                                                          s_dim)
-
-    optim = tf.train.AdamOptimizer(learning_rate).minimize(-ELBO)
-
-    # -----------------------------------------------------------------------------------#
-    # Generator function for test time sample generation
-    samples_test, test_params, log_p_x_test, theta_test = Generator.samples_generator_c(batch_data_list,
-                                                                            X_list, X_list_c,
-                                                                            types_list,
-                                                                            batch_size,
-                                                                            z_dim,
-                                                                            y_dim_output,
-                                                                            y_dim_partition,
-                                                                            s_dim,
-                                                                            tau,
-                                                                            normalization_params)
-
-    # -----------------------------------------------------------------------------------#
-    #  Decoder for test time counterfactuals
-    #  'samples_perturbed': does not contain 'x' samples
-
-    print('[*] Defining Test Time Decoder...')
-    theta_perturbed, samples_perturbed = Decoder.decoder_test_time(samples_z,
-                                                            z_dim,
-                                                            y_dim_output,
-                                                            y_dim_partition,
-                                                            batch_size,
-                                                            types_list)
-
-    # Evaluation Function not necessary here
-    degree_active = degree_active# must be less than 1
-    delta_kl = Evaluation.kl_z_diff(p_params, q_params, degree_active, batch_size, z_dim)
-
-    # -----------------------------------------------------------------------------------#
-    # Packing results
-
-    tf_nodes = {'batch_size': batch_size,  #feed
-                'ground_batch': batch_data_list,  #feed
-                'ground_batch_c': batch_data_list_c,  #feed
-                'tau_GS': tau,  #feed,
-                'samples_z': samples_z,  #feed
-                'samples': samples,
-                'log_p_x': log_p_x,
-                'loss_re': loss_reconstruction,
-                'loss': -ELBO,
-                'optim': optim,
-                'KL_s': KL_s,
-                'KL_z': KL_z,
-                'X': X_list,
-                'p_params': p_params,
-                'q_params': q_params,
-                'samples_test': samples_test,
-                'test_params': test_params,
-                'log_p_x_test': log_p_x_test,
-                'samples_perturbed': samples_perturbed,
-                'theta_test': theta_test,
-                'theta_perturbed': theta_perturbed,
-                'normalization_params': normalization_params,
-                'gradient_decoder': gradient_decoder,
-                'delta_kl': delta_kl}
-
-    return tf_nodes
+def C_CHVAE_graph(types_file, types_file_c, learning_rate=1e-3, z_dim=1, y_dim=1, s_dim=1, y_dim_partition=None, nsamples=1000, p=2, degree_active=0.95):
+    _, types_list = Helpers.place_holder_types(types_file, None)
+    _, types_list_c = Helpers.place_holder_types(types_file_c, None)
+    model = CHVAEModel(types_list, types_list_c, z_dim, y_dim, s_dim, y_dim_partition)
+    return model

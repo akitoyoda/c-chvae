@@ -84,6 +84,106 @@ def _split_tensor_by_types(batch_tensor: torch.Tensor, types_list: List[Dict[str
 # -----------------------------
 # Data generation
 # -----------------------------
+def _generate_blobs1_dgp(
+    n_samples: int,
+    boundary: float,
+    seed: int,
+    centers: Optional[np.ndarray] = None,
+    stds: Optional[np.ndarray] = None,
+    weights: Tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3),
+    right_margin: float = 0.05,
+):
+    """
+    Pawelczyk et al. (WWW'20) Example 1 ("make blobs") に寄せたDGP。
+
+    目的:
+      - 左2クラスタ: decision boundary x2=boundary をまたいで y=0/1 を含む
+      - 右クラスタ: boundary を絶対にまたがない (常に x2 < boundary) -> 常に y=0
+      - 縦長: y方向の標準偏差をx方向より大きくする
+
+    実装:
+      - 3つのガウスからサンプリング
+      - 右クラスタは rejection sampling で x2 < boundary - right_margin を保証
+    """
+    rng = np.random.RandomState(seed)
+
+    if centers is None:
+        # x1: 左(-9), 中(0), 右(9.5)
+        # x2: 左/中は boundary より少し下(4.8)に置き、分散でまたぐようにする
+        #     右は十分下(1.5)に置く
+        centers = np.array(
+            [
+                [-9.0, 4.8],   # left (straddles boundary)
+                [0.0, 4.8],    # middle (straddles boundary)
+                [9.5, 1.5],    # right (must stay below boundary)
+            ],
+            dtype=float,
+        )
+    else:
+        centers = np.asarray(centers, dtype=float)
+        assert centers.shape == (3, 2), "blobs_centers must be shape (3,2)"
+
+    if stds is None:
+        # 縦長にする: y方向のstdを大きめに
+        stds = np.array(
+            [
+                [1.0, 1.6],  # left: vertical
+                [1.0, 1.6],  # middle: vertical
+                [1.0, 1.0],  # right: moderate (and clipped)
+            ],
+            dtype=float,
+        )
+    else:
+        stds = np.asarray(stds, dtype=float)
+        assert stds.shape == (3, 2), "stds must be shape (3,2)"
+
+    # サンプル数配分
+    w = np.array(weights, dtype=float)
+    w = w / w.sum()
+    ns = (w * n_samples).astype(int)
+    ns[0] += n_samples - ns.sum()  # 端数調整
+
+    X_parts = []
+    cluster_ids = []
+
+    for k in range(3):
+        mu = centers[k]
+        sd = stds[k]
+        nk = int(ns[k])
+
+        if k < 2:
+            # 左・中: 普通にサンプル（boundary をまたぐのは分散に任せる）
+            Xk = rng.normal(loc=mu, scale=sd, size=(nk, 2))
+        else:
+            # 右: boundary をまたがないことを保証
+            #     x2 < boundary - right_margin を満たす点だけ採用
+            collected = []
+            need = nk
+            # ループが長引かないようにバッチ生成
+            while need > 0:
+                batch_n = max(need * 3, 512)
+                batch = rng.normal(loc=mu, scale=sd, size=(batch_n, 2))
+                batch = batch[batch[:, 1] < (boundary - right_margin)]
+                if batch.shape[0] == 0:
+                    continue
+                take = batch[:need]
+                collected.append(take)
+                need -= take.shape[0]
+            Xk = np.vstack(collected)
+
+        X_parts.append(Xk)
+        cluster_ids.append(np.full((Xk.shape[0],), k, dtype=int))
+
+    X = np.vstack(X_parts)
+    cluster = np.concatenate(cluster_ids)
+
+    # シャッフル
+    perm = rng.permutation(X.shape[0])
+    X = X[perm]
+    cluster = cluster[perm]
+    return X, cluster
+
+
 def _prepare_data(
     dataset: str,
     samples: int,
@@ -108,35 +208,24 @@ def _prepare_data(
         return X_train, X_test, y_train, y_test, scaler, clf
 
     if dataset == "blobs1":
-        # ---- Experiment 1 (WWW'20 Example 1) ----
-        # Goal: one cluster above boundary, but NOT in the upper-right, so that
-        # sparse/vertical changes can land in empty regions.
-        if blobs_centers is None:
-            blobs_centers = np.array(
-                [
-                    [-4.0, 8.0],  # positive region (x2>6), upper-left
-                    [0.0, 3.0],   # negative region
-                    [5.0, 2.0],   # negative region, right-lower
-                ],
-                dtype=float,
-            )
-
-        X, _cluster = make_blobs(
+        # ---- Experiment 1 (WWW'20 Example 1: "make blobs") ----
+        X, _cluster = _generate_blobs1_dgp(
             n_samples=samples,
-            centers=blobs_centers,
-            cluster_std=1.0,
-            random_state=seed,
+            boundary=boundary,
+            seed=seed,
+            centers=blobs_centers,  # 渡されなければ上のデフォルト中心を使う
         )
 
-        # Label rule from the paper: y = I(x2 > 6)
+        # Label rule from the paper: y = I(x2 > boundary)
         y = (X[:, 1] > boundary).astype(int)
 
-        # stratify can fail if one class is extremely small; guard it
+        # stratify は片側が少なすぎると落ちるので保険
         stratify = y if (np.unique(y).size == 2 and min(np.bincount(y)) >= 2) else None
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=seed, stratify=stratify
         )
 
+        # Example 1 は「与えられた」定数分類器想定（I(x2>6)）
         scaler = IdentityScaler().fit(X_train)
         clf = StepClassifier(boundary=boundary, feature_index=1)
         return X_train, X_test, y_train, y_test, scaler, clf

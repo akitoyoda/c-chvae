@@ -295,7 +295,7 @@ def run_experiment(args: argparse.Namespace):
     X_train, X_test, y_train, y_test, scaler, clf = _prepare_data(args.samples, args.noise, args.seed)
     print(f"Classifier test accuracy: {clf.score(scaler.transform(X_test), y_test):.3f}")
 
-    types_list = [{"type": "real", "dim": 1}, {"type": "real", "dim": 1}]
+    types_list = [{"type": "real", "dim": 1} for _ in range(X_train.shape[1])]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = _train_chvae(X_train, types_list, device, args)
     normalization_params = _compute_normalization_from_train(X_train, types_list, device)

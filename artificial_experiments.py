@@ -113,9 +113,9 @@ def _generate_blobs1_dgp(
         #     右は十分下(1.5)に置く
         centers = np.array(
             [
-                [-9.0, 4.8],   # left (straddles boundary)
-                [0.0, 4.8],    # middle (straddles boundary)
-                [9.5, 1.5],    # right (must stay below boundary)
+                [-9.0, 6.0],   # left (straddles boundary)
+                [0.0, 4.0],    # middle (straddles boundary)
+                [9.5, 1.0],    # right (must stay below boundary)
             ],
             dtype=float,
         )
@@ -127,9 +127,9 @@ def _generate_blobs1_dgp(
         # 縦長にする: y方向のstdを大きめに
         stds = np.array(
             [
-                [1.0, 1.6],  # left: vertical
-                [1.0, 1.6],  # middle: vertical
-                [1.0, 1.0],  # right: moderate (and clipped)
+                [1.0, 1.5],  # left: vertical
+                [1.0, 1.5],  # middle: vertical
+                [1.0, 1.5],  # right: moderate (and clipped)
             ],
             dtype=float,
         )
@@ -469,6 +469,73 @@ def _plot_results(
     plt.close()
     print(f"Saved visualization to {plot_path}")
 
+def _plot_paper_fig2f(
+    counterfactuals: List[Dict[str, Any]],
+    plot_path: Path,
+    boundary: Optional[float] = None,
+    title: str = "(f) Test data and E(x) by our cchvae.",
+):
+    """
+    Paper-style plot like Pawelczyk et al. Fig. 2(f):
+      - show ONLY test points we explained (originals) and their counterfactuals E(x)
+      - colorbar: test data (0) vs counterfactuals (1)
+      - horizontal boundary line (x2 = boundary) if given
+    """
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # originals (the explained test points)
+    orig = np.array([c["original"] for c in counterfactuals], dtype=float)
+
+    # counterfactuals (only found ones)
+    cf_list = [c["counterfactual"] for c in counterfactuals if c.get("counterfactual") is not None]
+    cf = np.array(cf_list, dtype=float) if len(cf_list) else None
+
+    # labels for colormap: 0=test, 1=counterfactual
+    # Use RdBu so 0->red, 1->blue (paper-like)
+    cmap = "RdBu"
+    norm = plt.Normalize(vmin=0.0, vmax=1.0)
+
+    plt.figure(figsize=(4.6, 3.8))
+
+    # boundary line (paper shows x2=6)
+    if boundary is not None:
+        plt.axhline(boundary, color="tab:blue", linewidth=1.6)
+
+    # plot originals (test data)
+    plt.scatter(
+        orig[:, 0], orig[:, 1],
+        c=np.zeros(len(orig)),
+        cmap=cmap, norm=norm,
+        s=28, alpha=0.95,
+        edgecolors="none",
+    )
+
+    # plot counterfactuals if any
+    if cf is not None and len(cf) > 0:
+        plt.scatter(
+            cf[:, 0], cf[:, 1],
+            c=np.ones(len(cf)),
+            cmap=cmap, norm=norm,
+            s=28, alpha=0.95,
+            edgecolors="none",
+        )
+
+    # colorbar with paper-like label
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ticks=[0, 1])
+    cbar.set_label("counterfactuals | test data")
+    cbar.ax.set_yticklabels(["test data", "counterfactuals"])
+
+    plt.xlabel("First Feature (Continuous)")
+    plt.ylabel("Second Feature (Continuous)")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=250)
+    plt.close()
+    print(f"Saved paper-style Fig2(f) plot to {plot_path}")
+
+
 
 def run_experiment(args: argparse.Namespace):
     np.random.seed(args.seed)
@@ -527,7 +594,11 @@ def run_experiment(args: argparse.Namespace):
     title = f"{args.dataset} counterfactuals with C-CHVAE"
     boundary = args.boundary if args.dataset == "blobs1" else None
     _plot_results(X_train, X_test, y_train, y_test, clf, scaler, counterfactuals, Path(args.plot_path), boundary, title)
-
+    # NEW: paper-style Fig.2(f) plot (test data + E(x) only)
+    if args.paper_fig:
+        base = Path(args.plot_path)
+        paper_path = Path(args.paper_plot_path) if args.paper_plot_path else base.with_name(base.stem + "_fig2f.png")
+        _plot_paper_fig2f(counterfactuals, paper_path, boundary=boundary)
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Artificial data experiments with C-CHVAE (PyTorch)")
@@ -549,6 +620,8 @@ def build_parser():
     parser.add_argument("--search-max-steps", type=int, default=120, help="Max search expansions")
     parser.add_argument("--search-norm", type=int, default=2, help="Norm used in latent perturbations")
     parser.add_argument("--plot-path", type=str, default="outputs/exp1_blobs_cchvae.png", help="Path to save plot")
+    parser.add_argument("--paper-fig", action="store_true", help="Also save a paper-style Fig2(f) plot (test data + E(x) only).")
+    parser.add_argument("--paper-plot-path", type=str, default="", help="Optional path for paper-style plot. If empty, derive from --plot-path.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--quick", action="store_true", help="Use a faster configuration for smoke tests")
     return parser

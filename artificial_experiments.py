@@ -1,25 +1,25 @@
 """
-Reproduce the artificial data experiments from Pawelczyk et al. (WWW'20) using the
-PyTorch reimplementation of C-CHVAE in this repository.
+Reproduce the artificial data experiments from Pawelczyk et al. (WWW'20) using a
+PyTorch reimplementation of C-CHVAE.
 
-The script trains a CHVAE on a 2D synthetic (two moons) dataset, fits a simple
-classifier, and then searches the latent space for counterfactuals that flip the
-classifier's prediction. A visualization of the data manifold, decision
-boundary, and discovered counterfactuals is saved to disk.
+This version adds Experiment 1 (Example 1: "make blobs"):
+- x = [x1, x2] from a mixture of 3 Gaussians with sigma=1
+- y = I(x2 > boundary) with boundary=6 (stylized / constant classifier)
+
+It keeps the existing two-moons option for quick sanity checks.
 """
 
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from sklearn.datasets import make_moons
+from sklearn.datasets import make_moons, make_blobs
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -30,11 +30,48 @@ if str(CODE_DIR) not in sys.path:
 import Evaluation  # noqa: E402
 import Graph  # noqa: E402
 
-
 MIN_VARIANCE = 1e-6
 
 
-def _split_tensor_by_types(batch_tensor: torch.Tensor, types_list: List[Dict[str, str]]) -> List[torch.Tensor]:
+# -----------------------------
+# Small sklearn-like utilities
+# -----------------------------
+class IdentityScaler:
+    """Drop-in replacement for sklearn's scaler interface."""
+    def fit(self, X: np.ndarray) -> "IdentityScaler":
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        return np.asarray(X)
+
+    def inverse_transform(self, X: np.ndarray) -> np.ndarray:
+        return np.asarray(X)
+
+
+class StepClassifier:
+    """
+    Stylized classifier used in Pawelczyk et al. Example 1:
+      y = I(x2 > boundary)
+    Exposes sklearn-like predict/predict_proba/score methods.
+    """
+    def __init__(self, boundary: float = 6.0, feature_index: int = 1):
+        self.boundary = float(boundary)
+        self.feature_index = int(feature_index)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X)
+        return (X[:, self.feature_index] > self.boundary).astype(int)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        y = self.predict(X).astype(float)
+        return np.column_stack([1.0 - y, y])
+
+    def score(self, X: np.ndarray, y_true: np.ndarray) -> float:
+        y_pred = self.predict(X)
+        return float(np.mean(y_pred == y_true))
+
+
+def _split_tensor_by_types(batch_tensor: torch.Tensor, types_list: List[Dict[str, Any]]) -> List[torch.Tensor]:
     parts = []
     start = 0
     for t in types_list:
@@ -44,22 +81,75 @@ def _split_tensor_by_types(batch_tensor: torch.Tensor, types_list: List[Dict[str
     return parts
 
 
-def _prepare_data(samples: int, noise: float, seed: int):
-    X, y = make_moons(n_samples=samples, noise=noise, random_state=seed)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=seed, stratify=y
-    )
-    scaler = StandardScaler().fit(X_train)
-    clf = LogisticRegression(max_iter=1000, random_state=seed).fit(scaler.transform(X_train), y_train)
-    return X_train, X_test, y_train, y_test, scaler, clf
+# -----------------------------
+# Data generation
+# -----------------------------
+def _prepare_data(
+    dataset: str,
+    samples: int,
+    noise: float,
+    seed: int,
+    boundary: float,
+    blobs_centers: Optional[np.ndarray] = None,
+    test_size: float = 0.2,
+):
+    rng = np.random.RandomState(seed)
+
+    if dataset == "moons":
+        X, y = make_moons(n_samples=samples, noise=noise, random_state=seed)
+
+        # For moons we train a classifier (kept for debugging / sanity checks)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=seed, stratify=y
+        )
+        # Keep scaling off here too (your CHVAE already normalizes internally)
+        scaler = IdentityScaler().fit(X_train)
+        clf = LogisticRegression(max_iter=1000, random_state=seed).fit(scaler.transform(X_train), y_train)
+        return X_train, X_test, y_train, y_test, scaler, clf
+
+    if dataset == "blobs1":
+        # ---- Experiment 1 (WWW'20 Example 1) ----
+        # Goal: one cluster above boundary, but NOT in the upper-right, so that
+        # sparse/vertical changes can land in empty regions.
+        if blobs_centers is None:
+            blobs_centers = np.array(
+                [
+                    [-4.0, 8.0],  # positive region (x2>6), upper-left
+                    [0.0, 3.0],   # negative region
+                    [5.0, 2.0],   # negative region, right-lower
+                ],
+                dtype=float,
+            )
+
+        X, _cluster = make_blobs(
+            n_samples=samples,
+            centers=blobs_centers,
+            cluster_std=1.0,
+            random_state=seed,
+        )
+
+        # Label rule from the paper: y = I(x2 > 6)
+        y = (X[:, 1] > boundary).astype(int)
+
+        # stratify can fail if one class is extremely small; guard it
+        stratify = y if (np.unique(y).size == 2 and min(np.bincount(y)) >= 2) else None
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=seed, stratify=stratify
+        )
+
+        scaler = IdentityScaler().fit(X_train)
+        clf = StepClassifier(boundary=boundary, feature_index=1)
+        return X_train, X_test, y_train, y_test, scaler, clf
+
+    raise ValueError(f"Unknown dataset: {dataset}")
 
 
 def _train_chvae(
     X_train: np.ndarray,
-    types_list: List[Dict[str, str]],
+    types_list: List[Dict[str, Any]],
     device: torch.device,
     args: argparse.Namespace,
-) -> Graph.CHVAEModel:
+) -> "Graph.CHVAEModel":
     y_partition = [args.latent_y for _ in types_list]
     model = Graph.CHVAEModel(
         types_list=types_list,
@@ -107,7 +197,7 @@ def _loglik_params_to_numpy(normalization_params: List[Tuple[torch.Tensor, torch
 
 
 def _compute_normalization_from_train(
-    X_train: np.ndarray, types_list: List[Dict[str, str]], device: torch.device
+    X_train: np.ndarray, types_list: List[Dict[str, Any]], device: torch.device
 ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
     params = []
     start = 0
@@ -131,7 +221,7 @@ def _compute_normalization_from_train(
 
 def _apply_normalization(
     x_list: List[torch.Tensor],
-    types_list: List[Dict[str, str]],
+    types_list: List[Dict[str, Any]],
     normalization_params: List[Tuple[torch.Tensor, torch.Tensor]],
 ):
     normalized = []
@@ -164,11 +254,11 @@ def _theta_to_numpy(theta: List):
 
 
 def _counterfactual_search(
-    model: Graph.CHVAEModel,
-    types_list: List[Dict[str, str]],
+    model: "Graph.CHVAEModel",
+    types_list: List[Dict[str, Any]],
     x: np.ndarray,
-    clf: LogisticRegression,
-    scaler: StandardScaler,
+    clf: Any,
+    scaler: Any,
     device: torch.device,
     args: argparse.Namespace,
     normalization_params: List[Tuple[torch.Tensor, torch.Tensor]],
@@ -180,7 +270,7 @@ def _counterfactual_search(
     normalized, noisy = _apply_normalization(x_list, types_list, normalization_params)
 
     with torch.no_grad():
-        samples, q_params = model.encoder(noisy, tau=args.tau_min)
+        _samples, q_params = model.encoder(noisy, tau=args.tau_min)
 
     base_pred = clf.predict(scaler.transform(x.reshape(1, -1)))[0]
     target_label = 1 - base_pred
@@ -214,7 +304,7 @@ def _counterfactual_search(
             scaled_candidates = scaler.transform(x_tilde[candidate_idx])
             cf_distances = np.linalg.norm(scaled_candidates - scaled_base, axis=1)
             best_idx = candidate_idx[np.argmin(cf_distances)]
-            return x_tilde[best_idx], z_tilde[best_idx], cf_distances.min(), target_label
+            return x_tilde[best_idx], z_tilde[best_idx], float(cf_distances.min()), int(target_label)
 
         lower = upper
         upper += args.search_step
@@ -234,9 +324,9 @@ def _counterfactual_search(
         scaled_candidates = scaler.transform(x_tilde[candidate_idx])
         cf_distances = np.linalg.norm(scaled_candidates - scaled_base, axis=1)
         best_idx = candidate_idx[np.argmin(cf_distances)]
-        return x_tilde[best_idx], random_z[best_idx], cf_distances.min(), target_label
+        return x_tilde[best_idx], random_z[best_idx], float(cf_distances.min()), int(target_label)
 
-    return None, None, None, target_label
+    return None, None, None, int(target_label)
 
 
 def _plot_results(
@@ -244,27 +334,33 @@ def _plot_results(
     X_test: np.ndarray,
     y_train: np.ndarray,
     y_test: np.ndarray,
-    clf: LogisticRegression,
-    scaler: StandardScaler,
+    clf: Any,
+    scaler: Any,
     counterfactuals: List[Dict[str, np.ndarray]],
     plot_path: Path,
+    boundary: Optional[float] = None,
+    title: str = "Artificial data counterfactual search with C-CHVAE",
 ):
     plot_path.parent.mkdir(parents=True, exist_ok=True)
+
     grid_x, grid_y = np.meshgrid(
-        np.linspace(X_train[:, 0].min() - 0.5, X_train[:, 0].max() + 0.5, 200),
-        np.linspace(X_train[:, 1].min() - 0.5, X_train[:, 1].max() + 0.5, 200),
+        np.linspace(X_train[:, 0].min() - 0.5, X_train[:, 0].max() + 0.5, 240),
+        np.linspace(X_train[:, 1].min() - 0.5, X_train[:, 1].max() + 0.5, 240),
     )
     grid_points = np.c_[grid_x.ravel(), grid_y.ravel()]
     probs = clf.predict_proba(scaler.transform(grid_points))[:, 1].reshape(grid_x.shape)
 
     plt.figure(figsize=(8, 6))
-    contour = plt.contourf(grid_x, grid_y, probs, levels=20, cmap="RdBu", alpha=0.4)
+    contour = plt.contourf(grid_x, grid_y, probs, levels=20, cmap="RdBu", alpha=0.35)
     plt.colorbar(contour, label="P(y=1)")
     plt.contour(grid_x, grid_y, probs, levels=[0.5], colors="k", linestyles="--", linewidths=1)
 
-    plt.scatter(X_train[:, 0], X_train[:, 1], c=y_train, cmap="coolwarm", alpha=0.4, label="train")
+    if boundary is not None:
+        plt.axhline(boundary, color="k", linestyle=":", linewidth=1, alpha=0.8, label=f"x2 = {boundary}")
+
+    plt.scatter(X_train[:, 0], X_train[:, 1], c=y_train, cmap="coolwarm", alpha=0.35, label="train")
     plt.scatter(
-        X_test[:, 0], X_test[:, 1], c=y_test, cmap="coolwarm", alpha=0.7, edgecolor="k", label="test"
+        X_test[:, 0], X_test[:, 1], c=y_test, cmap="coolwarm", alpha=0.75, edgecolor="k", linewidth=0.4, label="test"
     )
 
     for cf in counterfactuals:
@@ -272,13 +368,13 @@ def _plot_results(
             continue
         orig = cf["original"]
         candidate = cf["counterfactual"]
-        plt.plot([orig[0], candidate[0]], [orig[1], candidate[1]], "k--", alpha=0.6)
+        plt.plot([orig[0], candidate[0]], [orig[1], candidate[1]], "k--", alpha=0.55)
         plt.scatter(candidate[0], candidate[1], marker="x", c="black", s=60, label="_cf")
 
     plt.legend()
     plt.xlabel("x1")
     plt.ylabel("x2")
-    plt.title("Artificial data counterfactual search with C-CHVAE")
+    plt.title(title)
     plt.tight_layout()
     plt.savefig(plot_path, dpi=200)
     plt.close()
@@ -290,16 +386,23 @@ def run_experiment(args: argparse.Namespace):
     torch.manual_seed(args.seed)
 
     if args.quick:
-        args.samples = min(args.samples, 600)
+        args.samples = min(args.samples, 1200)
         args.epochs = min(args.epochs, 40)
         args.search_samples = min(args.search_samples, 200)
-        args.counterfactuals = min(args.counterfactuals, 5)
+        args.counterfactuals = min(args.counterfactuals, 10)
 
-    X_train, X_test, y_train, y_test, scaler, clf = _prepare_data(args.samples, args.noise, args.seed)
+    X_train, X_test, y_train, y_test, scaler, clf = _prepare_data(
+        dataset=args.dataset,
+        samples=args.samples,
+        noise=args.noise,
+        seed=args.seed,
+        boundary=args.boundary,
+    )
     print(f"Classifier test accuracy: {clf.score(scaler.transform(X_test), y_test):.3f}")
 
     types_list = [{"type": "real", "dim": 1} for _ in range(X_train.shape[1])]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     model = _train_chvae(X_train, types_list, device, args)
     normalization_params = _compute_normalization_from_train(X_train, types_list, device)
 
@@ -328,17 +431,21 @@ def run_experiment(args: argparse.Namespace):
     found = [c for c in counterfactuals if c["counterfactual"] is not None]
     if found:
         avg_distance = np.mean([c["distance"] for c in found])
-        print(f"Found {len(found)}/{len(counterfactuals)} counterfactuals. Avg scaled L2 distance: {avg_distance:.3f}")
+        print(f"Found {len(found)}/{len(counterfactuals)} counterfactuals. Avg input L2 distance: {avg_distance:.3f}")
     else:
         print("No counterfactuals were found with the current settings.")
 
-    _plot_results(X_train, X_test, y_train, y_test, clf, scaler, counterfactuals, Path(args.plot_path))
+    title = f"{args.dataset} counterfactuals with C-CHVAE"
+    boundary = args.boundary if args.dataset == "blobs1" else None
+    _plot_results(X_train, X_test, y_train, y_test, clf, scaler, counterfactuals, Path(args.plot_path), boundary, title)
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Artificial data experiments with C-CHVAE (PyTorch)")
-    parser.add_argument("--samples", type=int, default=2000, help="Total synthetic samples")
-    parser.add_argument("--noise", type=float, default=0.15, help="Noise level for make_moons")
+    parser.add_argument("--dataset", type=str, default="blobs1", choices=["blobs1", "moons"], help="Synthetic dataset")
+    parser.add_argument("--samples", type=int, default=10000, help="Total synthetic samples")
+    parser.add_argument("--noise", type=float, default=0.15, help="Noise level for make_moons (ignored for blobs1)")
+    parser.add_argument("--boundary", type=float, default=6.0, help="Decision boundary for blobs1: y=I(x2>boundary)")
     parser.add_argument("--batch-size", type=int, default=128, help="Training batch size")
     parser.add_argument("--epochs", type=int, default=120, help="Training epochs for CHVAE")
     parser.add_argument("--latent-z", type=int, default=2, help="Latent z dimension")
@@ -347,12 +454,12 @@ def build_parser():
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--tau-min", type=float, default=1e-3, help="Minimum Gumbel-Softmax temperature")
     parser.add_argument("--display", type=int, default=20, help="Epoch display frequency")
-    parser.add_argument("--counterfactuals", type=int, default=10, help="Number of test points to explain")
-    parser.add_argument("--search-samples", type=int, default=800, help="Latent perturbations per step")
+    parser.add_argument("--counterfactuals", type=int, default=25, help="Number of test points to explain")
+    parser.add_argument("--search-samples", type=int, default=1000, help="Latent perturbations per step")
     parser.add_argument("--search-step", type=float, default=0.25, help="Step size in latent space")
     parser.add_argument("--search-max-steps", type=int, default=120, help="Max search expansions")
     parser.add_argument("--search-norm", type=int, default=2, help="Norm used in latent perturbations")
-    parser.add_argument("--plot-path", type=str, default="outputs/artificial_counterfactuals.png", help="Path to save plot")
+    parser.add_argument("--plot-path", type=str, default="outputs/exp1_blobs_cchvae.png", help="Path to save plot")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--quick", action="store_true", help="Use a faster configuration for smoke tests")
     return parser

@@ -21,6 +21,22 @@ Ensure the `code` directory is on your `PYTHONPATH` when running scripts, for ex
 export PYTHONPATH=$PWD/code
 ```
 
+## Artificial data experiment (PyTorch)
+
+You can reproduce the artificial data experiments from the original paper with the PyTorch port by running:
+
+```
+python artificial_experiments.py --samples 2000 --epochs 120 --plot-path outputs/artificial_counterfactuals.png
+```
+
+For a quick smoke run that finishes in a few minutes:
+
+```
+python artificial_experiments.py --quick --plot-path /tmp/artificial_counterfactuals.png
+```
+
+The script trains a C-CHVAE on a 2D synthetic dataset, searches the latent space for counterfactuals that flip a simple classifier, and saves a visualization of the decision boundary and counterfactuals to the requested path.
+
 
 ## Bibtex 
 ```

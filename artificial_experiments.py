@@ -31,6 +31,9 @@ import Evaluation  # noqa: E402
 import Graph  # noqa: E402
 
 
+MIN_VARIANCE = 1e-6
+
+
 def _split_tensor_by_types(batch_tensor: torch.Tensor, types_list: List[Dict[str, str]]) -> List[torch.Tensor]:
     parts = []
     start = 0
@@ -113,11 +116,11 @@ def _compute_normalization_from_train(
         data = torch.tensor(X_train[:, start : start + dim], dtype=torch.float32, device=device)
         if t["type"] == "real":
             mean = data.mean(dim=0)
-            var = data.var(dim=0, unbiased=False).clamp(min=1e-6)
+            var = data.var(dim=0, unbiased=False).clamp(min=MIN_VARIANCE)
         elif t["type"] in {"pos", "count"}:
             data_log = torch.log1p(data)
             mean = data_log.mean(dim=0)
-            var = data_log.var(dim=0, unbiased=False).clamp(min=1e-6)
+            var = data_log.var(dim=0, unbiased=False).clamp(min=MIN_VARIANCE)
         else:
             mean = torch.tensor(0.0, device=device)
             var = torch.tensor(1.0, device=device)
@@ -191,7 +194,7 @@ def _counterfactual_search(
     for _ in range(args.search_max_steps):
         delta_z = np.random.randn(args.search_samples, z_base.shape[1])
         norm_p = np.linalg.norm(delta_z, ord=args.search_norm, axis=1)
-        norm_p = np.where(norm_p == 0, 1e-6, norm_p)
+        norm_p = np.where(norm_p == 0, MIN_VARIANCE, norm_p)
         distances = np.random.rand(args.search_samples) * (upper - lower) + lower
         delta_z = delta_z * (distances / norm_p)[:, None]
         z_tilde = z_base + delta_z

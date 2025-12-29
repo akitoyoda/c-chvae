@@ -614,12 +614,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("HELOC Figure4 reproduction (CCHVAE only, PyTorch)")
 
     # data
-    p.add_argument("--x-free-path", type=str, default="heloc_x.csv", help="mutable/free features (csv)")
-    p.add_argument("--x-c-path", type=str, default="heloc_x_c.csv", help="immutable/protected conditional features (csv)")
-    p.add_argument("--y-path", type=str, default="heloc_y.csv", help="labels (csv)")
+    p.add_argument("--x-free-path", type=str, default="./data/heloc/heloc_x.csv", help="mutable/free features (csv)")
+    p.add_argument("--x-c-path", type=str, default="./data/heloc/heloc_x_c.csv", help="immutable/protected conditional features (csv)")
+    p.add_argument("--y-path", type=str, default="./data/heloc/heloc_y.csv", help="labels (csv)")
 
-    p.add_argument("--types-free-path", type=str, default="heloc_types.csv", help="types file for x-free")
-    p.add_argument("--types-c-path", type=str, default="heloc_types_c_alt.csv", help="types file for x-c")
+    p.add_argument("--types-free-path", type=str, default="./data/heloc/heloc_types.csv", help="types file for x-free")
+    p.add_argument("--types-c-path", type=str, default="./data/heloc/heloc_types_c_alt.csv", help="types file for x-c")
 
     # split
     p.add_argument("--test-size", type=float, default=0.2)
@@ -650,7 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--eps-list", type=str, default="10,15,20,25,30,35")
 
     # output
-    p.add_argument("--out-dir", type=str, default="outputs_heloc")
+    p.add_argument("--out-dir", type=str, default="./outputs_heloc")
 
     return p
 

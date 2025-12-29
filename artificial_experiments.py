@@ -2,11 +2,16 @@
 Reproduce the artificial data experiments from Pawelczyk et al. (WWW'20) using a
 PyTorch reimplementation of C-CHVAE.
 
-This version adds Experiment 1 (Example 1: "make blobs"):
-- x = [x1, x2] from a mixture of 3 Gaussians with sigma=1
-- y = I(x2 > boundary) with boundary=6 (stylized / constant classifier)
+This script focuses on Experiment 1 (Example 1: "make blobs"):
+- x = [x1, x2] from a mixture of 3 Gaussians (3 modes)
+- classifier is stylized: y = I(x2 > boundary) with boundary=6
+- goal: generate counterfactuals for test points with f(x)=0
 
-It keeps the existing two-moons option for quick sanity checks.
+Key fixes to better match the paper:
+- DGP: left & middle clusters straddle boundary; right cluster never crosses boundary
+- Search: choose the closest counterfactual in *latent space* (Algorithm 1 intuition),
+         and stop at the smallest radius where a counterfactual exists.
+- Plots: add a Figure 2(f)-style visualization (test points + counterfactuals only)
 """
 
 import argparse
@@ -17,7 +22,7 @@ from typing import Any, Dict, List, Tuple, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from sklearn.datasets import make_moons, make_blobs
+from sklearn.datasets import make_moons
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
@@ -82,7 +87,7 @@ def _split_tensor_by_types(batch_tensor: torch.Tensor, types_list: List[Dict[str
 
 
 # -----------------------------
-# Data generation
+# Data generation (Example 1)
 # -----------------------------
 def _generate_blobs1_dgp(
     n_samples: int,
@@ -108,14 +113,12 @@ def _generate_blobs1_dgp(
     rng = np.random.RandomState(seed)
 
     if centers is None:
-        # x1: 左(-9), 中(0), 右(9.5)
-        # x2: 左/中は boundary より少し下(4.8)に置き、分散でまたぐようにする
-        #     右は十分下(1.5)に置く
+        # NOTE: middle x2 mean is lifted a bit so that it also has enough y=1 mass
         centers = np.array(
             [
-                [-9.0, 6.0],   # left (straddles boundary)
-                [0.0, 4.0],    # middle (straddles boundary)
-                [9.5, 1.0],    # right (must stay below boundary)
+                [-9.0, 5.7],   # left (straddles boundary)
+                [0.0, 4.9],    # middle (straddles boundary, but less than left)
+                [9.5, 1.5],    # right (must stay below boundary)
             ],
             dtype=float,
         )
@@ -124,12 +127,12 @@ def _generate_blobs1_dgp(
         assert centers.shape == (3, 2), "blobs_centers must be shape (3,2)"
 
     if stds is None:
-        # 縦長にする: y方向のstdを大きめに
+        # 縦長: y方向のstdを大きめ / x方向を小さめ（左2クラスタの分離を強める）
         stds = np.array(
             [
-                [1.0, 1.5],  # left: vertical
-                [1.0, 1.5],  # middle: vertical
-                [1.0, 1.5],  # right: moderate (and clipped)
+                [0.85, 1.85],  # left: vertical & separated
+                [0.85, 1.85],  # middle: vertical & separated
+                [1.00, 1.20],  # right: moderate (and clipped)
             ],
             dtype=float,
         )
@@ -152,14 +155,11 @@ def _generate_blobs1_dgp(
         nk = int(ns[k])
 
         if k < 2:
-            # 左・中: 普通にサンプル（boundary をまたぐのは分散に任せる）
             Xk = rng.normal(loc=mu, scale=sd, size=(nk, 2))
         else:
-            # 右: boundary をまたがないことを保証
-            #     x2 < boundary - right_margin を満たす点だけ採用
+            # right: guarantee x2 < boundary
             collected = []
             need = nk
-            # ループが長引かないようにバッチ生成
             while need > 0:
                 batch_n = max(need * 3, 512)
                 batch = rng.normal(loc=mu, scale=sd, size=(batch_n, 2))
@@ -177,7 +177,6 @@ def _generate_blobs1_dgp(
     X = np.vstack(X_parts)
     cluster = np.concatenate(cluster_ids)
 
-    # シャッフル
     perm = rng.permutation(X.shape[0])
     X = X[perm]
     cluster = cluster[perm]
@@ -193,39 +192,29 @@ def _prepare_data(
     blobs_centers: Optional[np.ndarray] = None,
     test_size: float = 0.2,
 ):
-    rng = np.random.RandomState(seed)
-
     if dataset == "moons":
         X, y = make_moons(n_samples=samples, noise=noise, random_state=seed)
-
-        # For moons we train a classifier (kept for debugging / sanity checks)
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=seed, stratify=y
         )
-        # Keep scaling off here too (your CHVAE already normalizes internally)
         scaler = IdentityScaler().fit(X_train)
         clf = LogisticRegression(max_iter=1000, random_state=seed).fit(scaler.transform(X_train), y_train)
         return X_train, X_test, y_train, y_test, scaler, clf
 
     if dataset == "blobs1":
-        # ---- Experiment 1 (WWW'20 Example 1: "make blobs") ----
         X, _cluster = _generate_blobs1_dgp(
             n_samples=samples,
             boundary=boundary,
             seed=seed,
-            centers=blobs_centers,  # 渡されなければ上のデフォルト中心を使う
+            centers=blobs_centers,
         )
-
-        # Label rule from the paper: y = I(x2 > boundary)
         y = (X[:, 1] > boundary).astype(int)
 
-        # stratify は片側が少なすぎると落ちるので保険
         stratify = y if (np.unique(y).size == 2 and min(np.bincount(y)) >= 2) else None
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=seed, stratify=stratify
         )
 
-        # Example 1 は「与えられた」定数分類器想定（I(x2>6)）
         scaler = IdentityScaler().fit(X_train)
         clf = StepClassifier(boundary=boundary, feature_index=1)
         return X_train, X_test, y_train, y_test, scaler, clf
@@ -233,6 +222,9 @@ def _prepare_data(
     raise ValueError(f"Unknown dataset: {dataset}")
 
 
+# -----------------------------
+# CHVAE training helpers
+# -----------------------------
 def _train_chvae(
     X_train: np.ndarray,
     types_list: List[Dict[str, Any]],
@@ -342,6 +334,9 @@ def _theta_to_numpy(theta: List):
     return theta_np
 
 
+# -----------------------------
+# Counterfactual search (Algorithm 1 style)
+# -----------------------------
 def _counterfactual_search(
     model: "Graph.CHVAEModel",
     types_list: List[Dict[str, Any]],
@@ -352,6 +347,11 @@ def _counterfactual_search(
     args: argparse.Namespace,
     normalization_params: List[Tuple[torch.Tensor, torch.Tensor]],
 ):
+    """
+    Key change vs. your previous version:
+    - stop at the smallest latent radius where any counterfactual exists
+    - choose the candidate with the smallest *latent* distance ||z_tilde - z_base||_p
+    """
     model.eval()
     x_tensor = torch.tensor(x, dtype=torch.float32, device=device).unsqueeze(0)
     x_list = _split_tensor_by_types(x_tensor, types_list)
@@ -361,22 +361,28 @@ def _counterfactual_search(
     with torch.no_grad():
         _samples, q_params = model.encoder(noisy, tau=args.tau_min)
 
-    base_pred = clf.predict(scaler.transform(x.reshape(1, -1)))[0]
+    base_pred = int(clf.predict(scaler.transform(x.reshape(1, -1)))[0])
     target_label = 1 - base_pred
-    z_base = q_params["z"][0].detach().cpu().numpy()
+
+    # q_params["z"][0] should be mean (following the TF repo convention)
+    z_base = q_params["z"][0].detach().cpu().numpy()  # (1, z_dim)
+
     normalization_params_np = _loglik_params_to_numpy(normalization_params)
 
     lower = 0.0
     upper = args.search_step
-    scaled_base = scaler.transform(x.reshape(1, -1))
+
+    best = None  # (x_cf, z_cf, latent_dist)
 
     for _ in range(args.search_max_steps):
-        delta_z = np.random.randn(args.search_samples, z_base.shape[1])
-        norm_p = np.linalg.norm(delta_z, ord=args.search_norm, axis=1)
+        # sample uniformly in a p-norm shell (approx)
+        delta = np.random.randn(args.search_samples, z_base.shape[1])
+        norm_p = np.linalg.norm(delta, ord=args.search_norm, axis=1)
         norm_p = np.where(norm_p == 0, MIN_VARIANCE, norm_p)
-        distances = np.random.rand(args.search_samples) * (upper - lower) + lower
-        delta_z = delta_z * (distances / norm_p)[:, None]
-        z_tilde = z_base + delta_z
+
+        radii = np.random.rand(args.search_samples) * (upper - lower) + lower
+        delta = delta * (radii / norm_p)[:, None]
+        z_tilde = z_base + delta  # (N, z_dim)
 
         z_tilde_tensor = torch.tensor(z_tilde, dtype=torch.float32, device=device)
         theta_perturbed, _ = model.decoder.decode_only(z_tilde_tensor)
@@ -386,166 +392,146 @@ def _counterfactual_search(
             normalized, theta_np, normalization_params_np, types_list
         )
         x_tilde = np.concatenate(x_tilde_parts, axis=1)
-        preds = clf.predict(scaler.transform(x_tilde))
 
+        preds = clf.predict(scaler.transform(x_tilde))
         candidate_idx = np.where(preds == target_label)[0]
+
         if candidate_idx.size:
-            scaled_candidates = scaler.transform(x_tilde[candidate_idx])
-            cf_distances = np.linalg.norm(scaled_candidates - scaled_base, axis=1)
-            best_idx = candidate_idx[np.argmin(cf_distances)]
-            return x_tilde[best_idx], z_tilde[best_idx], float(cf_distances.min()), int(target_label)
+            # choose smallest latent move (Algorithm 1 intuition)
+            latent_dists = np.linalg.norm((z_tilde[candidate_idx] - z_base), ord=args.search_norm, axis=1)
+            j = int(candidate_idx[np.argmin(latent_dists)])
+            x_cf = x_tilde[j]
+            z_cf = z_tilde[j]
+            best = (x_cf, z_cf, float(np.min(latent_dists)))
+            break
 
         lower = upper
         upper += args.search_step
 
-    # Fallback: sample broadly from the prior if targeted search failed
-    random_z = np.random.randn(args.search_samples * 2, z_base.shape[1])
-    z_tilde_tensor = torch.tensor(random_z, dtype=torch.float32, device=device)
-    theta_perturbed, _ = model.decoder.decode_only(z_tilde_tensor)
-    theta_np = _theta_to_numpy(theta_perturbed)
-    x_tilde_parts, _ = Evaluation.loglik_evaluation_test(
-        normalized, theta_np, normalization_params_np, types_list
-    )
-    x_tilde = np.concatenate(x_tilde_parts, axis=1)
-    preds = clf.predict(scaler.transform(x_tilde))
-    candidate_idx = np.where(preds == target_label)[0]
-    if candidate_idx.size:
-        scaled_candidates = scaler.transform(x_tilde[candidate_idx])
-        cf_distances = np.linalg.norm(scaled_candidates - scaled_base, axis=1)
-        best_idx = candidate_idx[np.argmin(cf_distances)]
-        return x_tilde[best_idx], random_z[best_idx], float(cf_distances.min()), int(target_label)
+    if best is None:
+        return None, None, None, target_label
 
-    return None, None, None, int(target_label)
+    x_cf, z_cf, latent_dist = best
+    input_l2 = float(np.linalg.norm(x_cf - x, ord=2))
+    return x_cf, z_cf, input_l2, target_label
 
 
-def _plot_results(
+# -----------------------------
+# Plotting
+# -----------------------------
+def _plot_overview(
     X_train: np.ndarray,
     X_test: np.ndarray,
     y_train: np.ndarray,
     y_test: np.ndarray,
     clf: Any,
     scaler: Any,
-    counterfactuals: List[Dict[str, np.ndarray]],
-    plot_path: Path,
-    boundary: Optional[float] = None,
-    title: str = "Artificial data counterfactual search with C-CHVAE",
+    counterfactuals: List[Dict[str, Any]],
+    out_path: Path,
+    boundary: Optional[float],
+    title: str,
 ):
-    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(9.2, 6.5))
 
-    grid_x, grid_y = np.meshgrid(
-        np.linspace(X_train[:, 0].min() - 0.5, X_train[:, 0].max() + 0.5, 240),
-        np.linspace(X_train[:, 1].min() - 0.5, X_train[:, 1].max() + 0.5, 240),
-    )
-    grid_points = np.c_[grid_x.ravel(), grid_y.ravel()]
-    probs = clf.predict_proba(scaler.transform(grid_points))[:, 1].reshape(grid_x.shape)
+    # background P(y=1)
+    x1_min, x1_max = X_train[:, 0].min() - 1.0, X_train[:, 0].max() + 1.0
+    x2_min, x2_max = X_train[:, 1].min() - 1.0, X_train[:, 1].max() + 1.0
+    xx, yy = np.meshgrid(np.linspace(x1_min, x1_max, 250), np.linspace(x2_min, x2_max, 250))
+    grid = np.c_[xx.ravel(), yy.ravel()]
+    zz = clf.predict_proba(scaler.transform(grid))[:, 1].reshape(xx.shape)
+    plt.contourf(xx, yy, zz, levels=20, cmap="RdBu", alpha=0.25)
 
-    plt.figure(figsize=(8, 6))
-    contour = plt.contourf(grid_x, grid_y, probs, levels=20, cmap="RdBu", alpha=0.35)
-    plt.colorbar(contour, label="P(y=1)")
-    plt.contour(grid_x, grid_y, probs, levels=[0.5], colors="k", linestyles="--", linewidths=1)
+    # train points
+    plt.scatter(X_train[y_train == 0, 0], X_train[y_train == 0, 1], s=10, alpha=0.35, label="train y=0")
+    plt.scatter(X_train[y_train == 1, 0], X_train[y_train == 1, 1], s=10, alpha=0.35, label="train y=1")
 
+    # test points (we usually explain f=0 points)
+    plt.scatter(X_test[:, 0], X_test[:, 1], s=35, c="navy", alpha=0.70, edgecolor="k", linewidth=0.3, label="test")
+
+    # boundary line (for blobs1)
     if boundary is not None:
-        plt.axhline(boundary, color="k", linestyle=":", linewidth=1, alpha=0.8, label=f"x2 = {boundary}")
+        plt.axhline(boundary, color="k", linestyle="--", linewidth=1.3, label=f"true boundary x2={boundary:g}")
 
-    plt.scatter(X_train[:, 0], X_train[:, 1], c=y_train, cmap="coolwarm", alpha=0.35, label="train")
-    plt.scatter(
-        X_test[:, 0], X_test[:, 1], c=y_test, cmap="coolwarm", alpha=0.75, edgecolor="k", linewidth=0.4, label="test"
-    )
-
+    # counterfactual arrows
     for cf in counterfactuals:
         if cf["counterfactual"] is None:
             continue
         orig = cf["original"]
-        candidate = cf["counterfactual"]
-        plt.plot([orig[0], candidate[0]], [orig[1], candidate[1]], "k--", alpha=0.55)
-        plt.scatter(candidate[0], candidate[1], marker="x", c="black", s=60, label="_cf")
+        cand = cf["counterfactual"]
+        plt.plot([orig[0], cand[0]], [orig[1], cand[1]], "k--", alpha=0.50)
+        plt.scatter(cand[0], cand[1], marker="x", c="black", s=70, label="_cf")
 
-    plt.legend()
+    plt.title(title)
     plt.xlabel("x1")
     plt.ylabel("x2")
-    plt.title(title)
+    plt.legend(loc="upper right")
     plt.tight_layout()
-    plt.savefig(plot_path, dpi=200)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=200)
     plt.close()
-    print(f"Saved visualization to {plot_path}")
+    print(f"[saved] {out_path}")
 
-def _plot_paper_fig2f(
+
+def _plot_fig2f_style(
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    clf: Any,
+    scaler: Any,
     counterfactuals: List[Dict[str, Any]],
-    plot_path: Path,
-    boundary: Optional[float] = None,
-    title: str = "(f) Test data and E(x) by our cchvae.",
+    out_path: Path,
+    boundary: float,
 ):
     """
-    Paper-style plot like Pawelczyk et al. Fig. 2(f):
-      - show ONLY test points we explained (originals) and their counterfactuals E(x)
-      - colorbar: test data (0) vs counterfactuals (1)
-      - horizontal boundary line (x2 = boundary) if given
+    Paper Figure 2(f) style:
+    - show only test points (f=0 pool) and their counterfactuals (f=1)
     """
-    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    # pick test points that are actually f=0 (using classifier)
+    f_test = clf.predict(scaler.transform(X_test))
+    test0 = X_test[f_test == 0]
 
-    # originals (the explained test points)
-    orig = np.array([c["original"] for c in counterfactuals], dtype=float)
+    plt.figure(figsize=(6.2, 5.2))
 
-    # counterfactuals (only found ones)
-    cf_list = [c["counterfactual"] for c in counterfactuals if c.get("counterfactual") is not None]
-    cf = np.array(cf_list, dtype=float) if len(cf_list) else None
+    # test points (f=0)
+    plt.scatter(test0[:, 0], test0[:, 1], s=38, c="#7a1020", alpha=0.80, edgecolor="none", label="test data (f=0)")
 
-    # labels for colormap: 0=test, 1=counterfactual
-    # Use RdBu so 0->red, 1->blue (paper-like)
-    cmap = "RdBu"
-    norm = plt.Normalize(vmin=0.0, vmax=1.0)
+    # boundary line
+    plt.axhline(boundary, color="#1f77b4", linewidth=2.0)
 
-    plt.figure(figsize=(4.6, 3.8))
+    # CF points (f=1)
+    cfs = [c for c in counterfactuals if c["counterfactual"] is not None]
+    if cfs:
+        cf_xy = np.stack([c["counterfactual"] for c in cfs], axis=0)
+        plt.scatter(cf_xy[:, 0], cf_xy[:, 1], s=46, c="#163a9c", alpha=0.90, edgecolor="none", label="counterfactuals (f=1)")
 
-    # boundary line (paper shows x2=6)
-    if boundary is not None:
-        plt.axhline(boundary, color="tab:blue", linewidth=1.6)
-
-    # plot originals (test data)
-    plt.scatter(
-        orig[:, 0], orig[:, 1],
-        c=np.zeros(len(orig)),
-        cmap=cmap, norm=norm,
-        s=28, alpha=0.95,
-        edgecolors="none",
-    )
-
-    # plot counterfactuals if any
-    if cf is not None and len(cf) > 0:
-        plt.scatter(
-            cf[:, 0], cf[:, 1],
-            c=np.ones(len(cf)),
-            cmap=cmap, norm=norm,
-            s=28, alpha=0.95,
-            edgecolors="none",
-        )
-
-    # colorbar with paper-like label
-    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
-    sm.set_array([])
-    cbar = plt.colorbar(sm, ticks=[0, 1])
-    cbar.set_label("counterfactuals | test data")
-    cbar.ax.set_yticklabels(["test data", "counterfactuals"])
+        # lines
+        for c in cfs:
+            o = c["original"]
+            p = c["counterfactual"]
+            plt.plot([o[0], p[0]], [o[1], p[1]], color="gray", alpha=0.35, linewidth=1.0)
 
     plt.xlabel("First Feature (Continuous)")
     plt.ylabel("Second Feature (Continuous)")
-    plt.title(title)
+    plt.title("(f) Test data and E(x) by our cchvae.")
+    plt.legend(loc="upper right")
     plt.tight_layout()
-    plt.savefig(plot_path, dpi=250)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=220)
     plt.close()
-    print(f"Saved paper-style Fig2(f) plot to {plot_path}")
+    print(f"[saved] {out_path}")
 
 
-
+# -----------------------------
+# Experiment runner
+# -----------------------------
 def run_experiment(args: argparse.Namespace):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
     if args.quick:
-        args.samples = min(args.samples, 1200)
-        args.epochs = min(args.epochs, 40)
-        args.search_samples = min(args.search_samples, 200)
-        args.counterfactuals = min(args.counterfactuals, 10)
+        args.samples = min(args.samples, 1500)
+        args.epochs = min(args.epochs, 60)
+        args.search_samples = min(args.search_samples, 250)
+        args.counterfactuals = min(args.counterfactuals, 12)
 
     X_train, X_test, y_train, y_test, scaler, clf = _prepare_data(
         dataset=args.dataset,
@@ -556,22 +542,24 @@ def run_experiment(args: argparse.Namespace):
     )
     print(f"Classifier test accuracy: {clf.score(scaler.transform(X_test), y_test):.3f}")
 
+    # tabular -> all real 1D features
     types_list = [{"type": "real", "dim": 1} for _ in range(X_train.shape[1])]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = _train_chvae(X_train, types_list, device, args)
     normalization_params = _compute_normalization_from_train(X_train, types_list, device)
+    model = _train_chvae(X_train, types_list, device, args)
 
+    # choose points with f(x)=0
     preds_test = clf.predict(scaler.transform(X_test))
-    target_pool_idx = np.where(preds_test == 0)[0]
-    if target_pool_idx.size < args.counterfactuals:
-        target_pool_idx = np.arange(min(len(X_test), args.counterfactuals))
-    chosen_idx = target_pool_idx[: args.counterfactuals]
+    pool = np.where(preds_test == 0)[0]
+    if pool.size < args.counterfactuals:
+        pool = np.arange(min(len(X_test), args.counterfactuals))
+    chosen = pool[: args.counterfactuals]
 
     counterfactuals = []
-    for idx in tqdm(chosen_idx, desc="Searching counterfactuals"):
+    for idx in tqdm(chosen, desc="Searching counterfactuals"):
         original = X_test[idx]
-        cf, z_cf, distance, target_label = _counterfactual_search(
+        cf, z_cf, input_dist, target_label = _counterfactual_search(
             model, types_list, original, clf, scaler, device, args, normalization_params
         )
         counterfactuals.append(
@@ -579,55 +567,63 @@ def run_experiment(args: argparse.Namespace):
                 "original": original,
                 "counterfactual": cf,
                 "latent": z_cf,
-                "distance": distance,
+                "distance": input_dist,
                 "target": target_label,
             }
         )
 
     found = [c for c in counterfactuals if c["counterfactual"] is not None]
     if found:
-        avg_distance = np.mean([c["distance"] for c in found])
-        print(f"Found {len(found)}/{len(counterfactuals)} counterfactuals. Avg input L2 distance: {avg_distance:.3f}")
+        avg_dist = float(np.mean([c["distance"] for c in found]))
+        print(f"Found {len(found)}/{len(counterfactuals)} counterfactuals. Avg input L2 distance: {avg_dist:.3f}")
     else:
         print("No counterfactuals were found with the current settings.")
 
-    title = f"{args.dataset} counterfactuals with C-CHVAE"
+    # plots
+    out = Path(args.plot_path)
     boundary = args.boundary if args.dataset == "blobs1" else None
-    _plot_results(X_train, X_test, y_train, y_test, clf, scaler, counterfactuals, Path(args.plot_path), boundary, title)
-    # NEW: paper-style Fig.2(f) plot (test data + E(x) only)
-    if args.paper_fig:
-        base = Path(args.plot_path)
-        paper_path = Path(args.paper_plot_path) if args.paper_plot_path else base.with_name(base.stem + "_fig2f.png")
-        _plot_paper_fig2f(counterfactuals, paper_path, boundary=boundary)
+    _plot_overview(
+        X_train, X_test, y_train, y_test, clf, scaler, counterfactuals,
+        out, boundary, title=f"{args.dataset} counterfactuals with C-CHVAE"
+    )
+    if args.dataset == "blobs1":
+        out2 = out.with_name(out.stem + "_fig2f" + out.suffix)
+        _plot_fig2f_style(X_test, y_test, clf, scaler, counterfactuals, out2, boundary=args.boundary)
+
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Artificial data experiments with C-CHVAE (PyTorch)")
-    parser.add_argument("--dataset", type=str, default="blobs1", choices=["blobs1", "moons"], help="Synthetic dataset")
-    parser.add_argument("--samples", type=int, default=10000, help="Total synthetic samples")
-    parser.add_argument("--noise", type=float, default=0.15, help="Noise level for make_moons (ignored for blobs1)")
-    parser.add_argument("--boundary", type=float, default=6.0, help="Decision boundary for blobs1: y=I(x2>boundary)")
-    parser.add_argument("--batch-size", type=int, default=128, help="Training batch size")
-    parser.add_argument("--epochs", type=int, default=120, help="Training epochs for CHVAE")
-    parser.add_argument("--latent-z", type=int, default=2, help="Latent z dimension")
-    parser.add_argument("--latent-s", type=int, default=3, help="Latent s (categorical) dimension")
-    parser.add_argument("--latent-y", type=int, default=4, help="Latent y dimension per feature")
-    parser.add_argument("--learning-rate", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--tau-min", type=float, default=1e-3, help="Minimum Gumbel-Softmax temperature")
-    parser.add_argument("--display", type=int, default=20, help="Epoch display frequency")
-    parser.add_argument("--counterfactuals", type=int, default=25, help="Number of test points to explain")
-    parser.add_argument("--search-samples", type=int, default=1000, help="Latent perturbations per step")
-    parser.add_argument("--search-step", type=float, default=0.25, help="Step size in latent space")
-    parser.add_argument("--search-max-steps", type=int, default=120, help="Max search expansions")
-    parser.add_argument("--search-norm", type=int, default=2, help="Norm used in latent perturbations")
-    parser.add_argument("--plot-path", type=str, default="outputs/exp1_blobs_cchvae.png", help="Path to save plot")
-    parser.add_argument("--paper-fig", action="store_true", help="Also save a paper-style Fig2(f) plot (test data + E(x) only).")
-    parser.add_argument("--paper-plot-path", type=str, default="", help="Optional path for paper-style plot. If empty, derive from --plot-path.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--quick", action="store_true", help="Use a faster configuration for smoke tests")
-    return parser
+    p = argparse.ArgumentParser(description="Artificial data experiments with C-CHVAE (PyTorch)")
+    p.add_argument("--dataset", type=str, default="blobs1", choices=["blobs1", "moons"])
+    p.add_argument("--samples", type=int, default=10000)
+    p.add_argument("--noise", type=float, default=0.15)
+    p.add_argument("--boundary", type=float, default=6.0)
+
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--epochs", type=int, default=160)
+    p.add_argument("--learning-rate", type=float, default=1e-3)
+
+    # latent dims
+    p.add_argument("--latent-z", type=int, default=2)
+    p.add_argument("--latent-s", type=int, default=3)   # = number of modes (3) for blobs1
+    p.add_argument("--latent-y", type=int, default=4)
+
+    # gumbel temp
+    p.add_argument("--tau-min", type=float, default=1e-3)
+    p.add_argument("--display", type=int, default=20)
+
+    # CF search
+    p.add_argument("--counterfactuals", type=int, default=25)
+    p.add_argument("--search-samples", type=int, default=1200)
+    p.add_argument("--search-step", type=float, default=0.25)
+    p.add_argument("--search-max-steps", type=int, default=140)
+    p.add_argument("--search-norm", type=int, default=2)
+
+    p.add_argument("--plot-path", type=str, default="outputs/exp1_blobs_cchvae.png")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--quick", action="store_true")
+    return p
 
 
 if __name__ == "__main__":
-    parser = build_parser()
-    args = parser.parse_args()
+    args = build_parser().parse_args()
     run_experiment(args)

@@ -518,6 +518,325 @@ def _plot_fig2f_style(
     plt.savefig(out_path, dpi=220)
     plt.close()
     print(f"[saved] {out_path}")
+    
+
+def _split_X_by_types(X: np.ndarray, types_list: List[Dict[str, Any]]) -> List[np.ndarray]:
+    """Split a 2D numpy array into a list of feature blocks according to types_list dims."""
+    parts = []
+    start = 0
+    for t in types_list:
+        dim = int(t.get("dim", 1))
+        parts.append(X[:, start:start + dim])
+        start += dim
+    return parts
+
+
+def _standardize_parts(parts: List[np.ndarray], normalization_params: List[Any]) -> List[np.ndarray]:
+    """
+    Standardize each part using (mean, std) in normalization_params.
+    normalization_params can be list of torch tensors / numpy / floats.
+    """
+    out = []
+    for i, x in enumerate(parts):
+        mu, sd = normalization_params[i]
+        mu = float(mu) if np.isscalar(mu) or hasattr(mu, "__float__") else float(np.array(mu).reshape(-1)[0])
+        sd = float(sd) if np.isscalar(sd) or hasattr(sd, "__float__") else float(np.array(sd).reshape(-1)[0])
+        sd = sd if sd > 1e-12 else 1.0
+        out.append((x - mu) / sd)
+    return out
+
+
+def _encode_z_and_comp(
+    model: Any,
+    X: np.ndarray,
+    types_list: List[Dict[str, Any]],
+    normalization_params: List[Any],
+    device: torch.device,
+    tau: float = 1e-3,
+    batch_size: int = 1024,
+):
+    """
+    Encode X -> z_mu and component assignment (argmax q(c|x) or argmax sampled s).
+    This is written defensively to handle small API differences.
+    Returns:
+      Z: (N, z_dim) numpy
+      comp: (N,) numpy int (0..s_dim-1) or None if unavailable
+      Sprob: (N, s_dim) numpy (softmax probs) or None
+    """
+    model.eval()
+    Z_list = []
+    comp_list = []
+    sprob_list = []
+
+    # normalize deterministically (NO noise) for visualization
+    X_parts = _split_X_by_types(X, types_list)
+    Xn_parts = _standardize_parts(X_parts, normalization_params)
+
+    N = X.shape[0]
+    for start in range(0, N, batch_size):
+        end = min(N, start + batch_size)
+        batch_parts = [p[start:end] for p in Xn_parts]
+        xb = [torch.tensor(p, dtype=torch.float32, device=device) for p in batch_parts]
+
+        with torch.no_grad():
+            enc = model.encoder
+            # try common encoder APIs
+            if hasattr(enc, "encode_only"):
+                q_params, samples = enc.encode_only(xb, tau)
+            elif hasattr(enc, "encode"):
+                q_params, samples = enc.encode(xb, tau)
+            else:
+                out = enc(xb, tau)
+                # could be (q_params, samples) or dict
+                if isinstance(out, (tuple, list)) and len(out) == 2:
+                    q_params, samples = out
+                else:
+                    q_params, samples = out, {}
+
+            # extract z mean
+            z_item = None
+            if isinstance(q_params, dict):
+                z_item = q_params.get("z", None)
+                if z_item is None:
+                    z_item = q_params.get("z_params", None)
+            if z_item is None and isinstance(samples, dict):
+                z_item = samples.get("z", None)
+
+            if isinstance(z_item, (tuple, list)) and len(z_item) >= 1:
+                z_mu = z_item[0]
+            else:
+                z_mu = z_item
+
+            if z_mu is None:
+                raise RuntimeError("Could not extract z mean from encoder output. Please check encoder API keys.")
+
+            z_mu_np = z_mu.detach().cpu().numpy()
+            Z_list.append(z_mu_np)
+
+            # extract component logits / probs
+            s_logits = None
+            if isinstance(q_params, dict):
+                s_logits = q_params.get("s", None)
+                if s_logits is None:
+                    s_logits = q_params.get("logits_s", None)
+
+            s_samp = None
+            if isinstance(samples, dict):
+                s_samp = samples.get("s", None)
+
+            if s_logits is not None:
+                probs = torch.softmax(s_logits, dim=1)
+                comp = torch.argmax(probs, dim=1)
+                sprob_list.append(probs.detach().cpu().numpy())
+                comp_list.append(comp.detach().cpu().numpy())
+            elif s_samp is not None:
+                comp = torch.argmax(s_samp, dim=1)
+                comp_list.append(comp.detach().cpu().numpy())
+            else:
+                # component not available
+                pass
+
+    Z = np.concatenate(Z_list, axis=0)
+    comp = np.concatenate(comp_list, axis=0) if len(comp_list) else None
+    Sprob = np.concatenate(sprob_list, axis=0) if len(sprob_list) else None
+    return Z, comp, Sprob
+
+
+def _get_prior_component_means(model: Any, s_dim: int, device: torch.device) -> Optional[np.ndarray]:
+    """
+    Try to extract prior component means mu_prior for each categorical component.
+    Returns (s_dim, z_dim) or None if not available.
+    """
+    dec = getattr(model, "decoder", None)
+    if dec is None:
+        return None
+
+    # common attribute names in various ports
+    layer = None
+    for attr in ["prior_layer", "prior_mu_layer", "p_z_mu", "mu_prior_layer", "prior"]:
+        if hasattr(dec, attr):
+            layer = getattr(dec, attr)
+            break
+
+    if layer is None or not callable(layer):
+        return None
+
+    mus = []
+    with torch.no_grad():
+        for k in range(s_dim):
+            s = torch.zeros(1, s_dim, device=device)
+            s[0, k] = 1.0
+            mu = layer(s)
+            if isinstance(mu, (tuple, list)):
+                mu = mu[0]
+            mus.append(mu.detach().cpu().numpy().reshape(1, -1))
+    return np.concatenate(mus, axis=0)
+
+
+def _pca1_projection(Z: np.ndarray) -> np.ndarray:
+    """Project Z onto its first principal component (deterministic via SVD)."""
+    Zc = Z - Z.mean(axis=0, keepdims=True)
+    # SVD on covariance direction
+    # For stability when N small, do SVD on Zc directly
+    _, _, Vt = np.linalg.svd(Zc, full_matrices=False)
+    pc1 = Vt[0]  # (z_dim,)
+    return Zc @ pc1  # (N,)
+
+
+def _plot_latent_modes(
+    model: Any,
+    X_train: np.ndarray,
+    counterfactuals: List[Dict[str, Any]],
+    types_list: List[Dict[str, Any]],
+    normalization_params: List[Any],
+    device: torch.device,
+    out_path: Path,
+    s_dim: int,
+    tau: float = 1e-3,
+    max_points: int = 6000,
+    seed: int = 0,
+):
+    """
+    Make latent 'mode' diagnostics:
+      (1) z scatter (PC1/PC2 or z1/z2) colored by argmax q(c|x)
+      (2) histogram/density of train z along PC1 (colored by component)
+      (3) overlay: train z (blue) vs counterfactual z* (red) along PC1
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rng = np.random.RandomState(seed)
+    n = len(X_train)
+    idx = np.arange(n)
+    if n > max_points:
+        idx = rng.choice(idx, size=max_points, replace=False)
+    Xsub = X_train[idx]
+
+    # encode train subset
+    Ztr, comp_tr, _ = _encode_z_and_comp(
+        model, Xsub, types_list, normalization_params, device, tau=tau, batch_size=1024
+    )
+
+    # collect cf latents & originals
+    Zcf = []
+    Zorig = []
+    orig_points = []
+    cf_points = []
+    for c in counterfactuals:
+        if c.get("counterfactual") is None:
+            continue
+        if c.get("latent") is None:
+            continue
+        orig = np.asarray(c["original"], dtype=float).reshape(1, -1)
+        zcf = np.asarray(c["latent"], dtype=float).reshape(1, -1)
+        Zcf.append(zcf)
+        orig_points.append(np.asarray(c["original"], dtype=float))
+        cf_points.append(np.asarray(c["counterfactual"], dtype=float))
+        Zorig.append(orig)
+
+    Zcf = np.concatenate(Zcf, axis=0) if len(Zcf) else None
+    Zorig_np = None
+    if len(Zorig):
+        Zorig_np, _, _ = _encode_z_and_comp(
+            model, np.concatenate(Zorig, axis=0), types_list, normalization_params, device, tau=tau, batch_size=512
+        )
+
+    mu_prior = _get_prior_component_means(model, s_dim=s_dim, device=device)
+
+    # choose 2D view axes
+    z_dim = Ztr.shape[1]
+    if z_dim >= 2:
+        Z2 = Ztr[:, :2]
+        if Zcf is not None:
+            Zcf2 = Zcf[:, :2]
+        else:
+            Zcf2 = None
+        if Zorig_np is not None:
+            Zorig2 = Zorig_np[:, :2]
+        else:
+            Zorig2 = None
+        if mu_prior is not None and mu_prior.shape[1] >= 2:
+            mu2 = mu_prior[:, :2]
+        else:
+            mu2 = None
+    else:
+        Z2 = None
+        Zcf2 = None
+        Zorig2 = None
+        mu2 = None
+
+    # 1D axis for "mode" inspection: use PC1 when z_dim>1, else z itself
+    if z_dim == 1:
+        z1_tr = Ztr[:, 0]
+        z1_cf = Zcf[:, 0] if Zcf is not None else None
+    else:
+        z1_tr = _pca1_projection(Ztr)
+        z1_cf = _pca1_projection(Zcf) if Zcf is not None else None
+
+    # --------- plot ----------
+    fig = plt.figure(figsize=(12.5, 3.6))
+
+    # (A) 2D latent scatter (if possible)
+    ax1 = fig.add_subplot(1, 3, 1)
+    if Z2 is not None:
+        if comp_tr is None:
+            ax1.scatter(Z2[:, 0], Z2[:, 1], s=6, alpha=0.35)
+        else:
+            ax1.scatter(Z2[:, 0], Z2[:, 1], c=comp_tr, s=6, alpha=0.35, cmap="tab10")
+
+        if mu2 is not None:
+            ax1.scatter(mu2[:, 0], mu2[:, 1], marker="x", s=110, c="k", linewidths=2, label="mu_prior")
+
+        # overlay originals and counterfactuals in latent
+        if Zorig2 is not None and Zcf2 is not None and len(Zorig2) == len(Zcf2):
+            ax1.scatter(Zorig2[:, 0], Zorig2[:, 1], c="orange", s=18, alpha=0.85, label="z_hat (orig)")
+            ax1.scatter(Zcf2[:, 0], Zcf2[:, 1], c="red", s=18, alpha=0.85, label="z* (cf)")
+            # arrows
+            for i in range(len(Zorig2)):
+                ax1.plot([Zorig2[i, 0], Zcf2[i, 0]], [Zorig2[i, 1], Zcf2[i, 1]], color="red", alpha=0.25, lw=1.0)
+
+        ax1.set_title("Latent space (train) + z_hat→z*")
+        ax1.set_xlabel("z1")
+        ax1.set_ylabel("z2")
+        ax1.legend(loc="best", fontsize=8, frameon=True)
+    else:
+        ax1.hist(z1_tr, bins=40, density=True, alpha=0.55, color="steelblue")
+        if z1_cf is not None and len(z1_cf):
+            ax1.hist(z1_cf, bins=30, density=True, alpha=0.55, color="tomato")
+        ax1.set_title("Latent 1D density")
+        ax1.set_xlabel("z (or PC1)")
+        ax1.set_ylabel("density")
+
+    # (B) train z density colored by component (PC1)
+    ax2 = fig.add_subplot(1, 3, 2)
+    if comp_tr is None:
+        ax2.hist(z1_tr, bins=50, density=True, alpha=0.8, color="steelblue")
+    else:
+        # plot each component separately to see modes clearly
+        for k in range(int(np.max(comp_tr)) + 1):
+            sel = (comp_tr == k)
+            if np.sum(sel) < 5:
+                continue
+            ax2.hist(z1_tr[sel], bins=50, density=True, histtype="step", linewidth=2.0, alpha=0.9, label=f"comp {k}")
+        ax2.legend(loc="best", fontsize=8, frameon=True)
+
+    ax2.set_title("Train z density along PC1 (by component)")
+    ax2.set_xlabel("PC1(z)  (or z if 1D)")
+    ax2.set_ylabel("density")
+
+    # (C) overlay train vs counterfactual z*
+    ax3 = fig.add_subplot(1, 3, 3)
+    ax3.hist(z1_tr, bins=50, density=True, alpha=0.55, color="royalblue", label="z_hat (train)")
+    if z1_cf is not None and len(z1_cf):
+        ax3.hist(z1_cf, bins=30, density=True, alpha=0.55, color="crimson", label="z* (counterfactuals)")
+    ax3.set_title("Overlay: train z_hat vs cf z* (PC1)")
+    ax3.set_xlabel("PC1(z)  (or z if 1D)")
+    ax3.set_ylabel("density")
+    ax3.legend(loc="best", fontsize=8, frameon=True)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=250)
+    plt.close()
+    print(f"[saved] {out_path}")
 
 
 # -----------------------------
@@ -589,6 +908,24 @@ def run_experiment(args: argparse.Namespace):
     if args.dataset == "blobs1":
         out2 = out.with_name(out.stem + "_fig2f" + out.suffix)
         _plot_fig2f_style(X_test, y_test, clf, scaler, counterfactuals, out2, boundary=args.boundary)
+        
+    # latent mode diagnostics (Fig2(b)(c)-style)
+    if args.plot_latent_modes and args.dataset == "blobs1":
+        out3 = out.with_name(out.stem + "_latent_modes" + out.suffix)
+        _plot_latent_modes(
+            model=model,
+            X_train=X_train,
+            counterfactuals=counterfactuals,
+            types_list=types_list,
+            normalization_params=normalization_params,
+            device=device,
+            out_path=out3,
+            s_dim=args.latent_s,
+            tau=args.tau_min,
+            max_points=args.latent_modes_max_points,
+            seed=args.latent_modes_seed,
+        )
+
 
 
 def build_parser():
@@ -621,6 +958,15 @@ def build_parser():
     p.add_argument("--plot-path", type=str, default="outputs/exp1_blobs_cchvae.png")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--quick", action="store_true")
+    
+    # latent mode viz (Fig.2(b)(c)-style diagnostics)
+    p.add_argument("--plot-latent-modes", action="store_true",
+                   help="Plot latent z mode diagnostics (train z density + cf z overlay).")
+    p.add_argument("--latent-modes-max-points", type=int, default=6000,
+                   help="Max #train points to encode for latent mode plots (subsample for speed).")
+    p.add_argument("--latent-modes-seed", type=int, default=0,
+                   help="Subsampling seed for latent mode plots.")
+
     return p
 
 

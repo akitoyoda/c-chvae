@@ -29,7 +29,7 @@ class Decoder(nn.Module):
         layers = []
         for idx, t in enumerate(types_list):
             dim = int(t['dim'])
-            t_type = str(t['type']).strip()
+            t_type = str(t['type']).strip()  # normalize potential CSV whitespace
             if t_type in ['real', 'pos']:
                 layers.append(nn.ModuleDict({
                     'mean': nn.Linear(y_dim_partition[idx], dim),
@@ -52,11 +52,10 @@ class Decoder(nn.Module):
                 raise ValueError(f"Unknown type {t_type}")
         self.type_layers = nn.ModuleList(layers)
 
-        init_generator = generator
         with torch.no_grad():
             for module in self.modules():
                 if isinstance(module, nn.Linear):
-                    module.weight.normal_(0.0, 0.05, generator=init_generator)
+                    module.weight.normal_(0.0, 0.05, generator=generator)
                     if module.bias is not None:
                         module.bias.zero_()
 

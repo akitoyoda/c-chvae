@@ -15,6 +15,10 @@ def y_partition(samples_y, types_list, y_dim_partition):
     return grouped
 
 
+def _normalize_type_label(value):
+    return str(value).strip()
+
+
 class Decoder(nn.Module):
     def __init__(self, types_list, y_dim_partition, z_dim, seed=None):
         super().__init__()
@@ -29,33 +33,39 @@ class Decoder(nn.Module):
         layers = []
         for idx, t in enumerate(types_list):
             dim = int(t['dim'])
-            if t['type'] in ['real', 'pos']:
+            t_type = _normalize_type_label(t['type'])  # normalize potential CSV whitespace
+            if t_type in ['real', 'pos']:
                 layers.append(nn.ModuleDict({
                     'mean': nn.Linear(y_dim_partition[idx], dim),
                     'sigma': nn.Linear(y_dim_partition[idx], dim)
                 }))
-            elif t['type'] == 'count':
+            elif t_type == 'count':
                 layers.append(nn.ModuleDict({
                     'lambda': nn.Linear(y_dim_partition[idx], dim)
                 }))
-            elif t['type'] == 'cat':
+            elif t_type == 'cat':
                 layers.append(nn.ModuleDict({
                     'log_pi': nn.Linear(y_dim_partition[idx], dim - 1)
                 }))
-            elif t['type'] == 'ordinal':
+            elif t_type == 'ordinal':
                 layers.append(nn.ModuleDict({
                     'theta': nn.Linear(y_dim_partition[idx], dim - 1),
                     'mean': nn.Linear(y_dim_partition[idx], 1)
                 }))
             else:
-                raise ValueError(f"Unknown type {t['type']}")
+                raise ValueError(f"Unknown type {t_type}")
         self.type_layers = nn.ModuleList(layers)
 
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                module.weight.normal_(0.0, 0.05, generator=generator)
-                if module.bias is not None:
-                    module.bias.zero_()
+        with torch.no_grad():
+            self.y_layer.weight.normal_(0.0, 0.05, generator=generator)
+            if self.y_layer.bias is not None:
+                self.y_layer.bias.zero_()
+
+            for layer_group in self.type_layers:
+                for layer in layer_group.values():
+                    layer.weight.normal_(0.0, 0.05, generator=generator)
+                    if layer.bias is not None:
+                        layer.bias.zero_()
 
     def forward(self, samples_z):
         samples = {'z': samples_z, 'y': None, 'x': None, 's': None}
@@ -91,19 +101,20 @@ class Decoder(nn.Module):
 
         theta = []
         for idx, t in enumerate(self.types_list):
+            t_type = _normalize_type_label(t['type'])
             out_layers = self.type_layers[idx]
-            if t['type'] == 'real':
+            if t_type == 'real':
                 theta.append([out_layers['mean'](grouped_samples_y[idx]),
                               out_layers['sigma'](grouped_samples_y[idx])])
-            elif t['type'] == 'pos':
+            elif t_type == 'pos':
                 theta.append([out_layers['mean'](grouped_samples_y[idx]),
                               out_layers['sigma'](grouped_samples_y[idx])])
-            elif t['type'] == 'count':
+            elif t_type == 'count':
                 theta.append(out_layers['lambda'](grouped_samples_y[idx]))
-            elif t['type'] == 'cat':
+            elif t_type == 'cat':
                 logits = out_layers['log_pi'](grouped_samples_y[idx])
                 theta.append(torch.cat([torch.zeros(samples_z.size(0), 1, device=samples_z.device, dtype=samples_z.dtype), logits], dim=1))
-            elif t['type'] == 'ordinal':
+            elif t_type == 'ordinal':
                 theta.append([out_layers['theta'](grouped_samples_y[idx]),
                               out_layers['mean'](grouped_samples_y[idx])])
         return theta, samples

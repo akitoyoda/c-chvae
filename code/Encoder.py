@@ -21,7 +21,32 @@ class BaseEncoder(nn.Module):
             self.z_mean_layers.append(nn.Linear(in_dim, z_dim))
             self.z_logvar_layers.append(nn.Linear(in_dim, z_dim))
 
-    def forward(self, x_list, tau, x_cond_list=None):
+        self._init_weights()
+
+    def _init_weights(self):
+        with torch.no_grad():
+            self.s_layer.weight.normal_(0.0, 0.05)
+            if self.s_layer.bias is not None:
+                self.s_layer.bias.zero_()
+
+            for layer in self.z_mean_layers:
+                layer.weight.normal_(0.0, 0.05)
+                if layer.bias is not None:
+                    layer.bias.zero_()
+
+            for layer in self.z_logvar_layers:
+                layer.weight.normal_(0.0, 0.05)
+                if layer.bias is not None:
+                    layer.bias.zero_()
+
+    def forward(self, x_list, tau, x_cond_list=None, deterministic_s=False):
+        """
+        Args:
+            x_list: list of tensors for each variable.
+            tau: temperature for Gumbel-Softmax during training.
+            x_cond_list: optional conditioning inputs.
+            deterministic_s: when True, sample s as one-hot argmax(log_pi) for inference/visualization.
+        """
         device = x_list[0].device
         batch_size = x_list[0].shape[0]
 
@@ -33,7 +58,11 @@ class BaseEncoder(nn.Module):
             x_cond = None
 
         log_pi = self.s_layer(x)
-        samples_s = F.gumbel_softmax(log_pi, tau=tau, hard=False, dim=1)
+        if deterministic_s:
+            indices = torch.argmax(log_pi, dim=1)
+            samples_s = F.one_hot(indices, num_classes=log_pi.size(1)).to(log_pi.dtype)
+        else:
+            samples_s = F.gumbel_softmax(log_pi, tau=tau, hard=False, dim=1)
 
         mean_qz = []
         log_var_qz = []
@@ -75,8 +104,25 @@ class ConditionalEncoder(BaseEncoder):
         super().__init__(input_dims, z_dim, s_dim, include_condition=True, condition_dim=sum(condition_dims))
 
 
-def z_distribution_GMM(samples_s, z_dim):
-    mean_pz = torch.zeros(samples_s.shape[0], z_dim, device=samples_s.device, dtype=samples_s.dtype)
-    log_var_pz = torch.zeros_like(mean_pz)
+def z_distribution_GMM(samples_s, z_dim, mean_dec_z=None, log_var_param=None):
+    """
+    Compute the Gaussian parameters for p(z|s).
+
+    Args:
+        samples_s: one-hot or soft samples from q(s|x).
+        z_dim: latent dimensionality.
+        mean_dec_z: optional nn.Linear mapping s -> mean; if None, defaults to zeros.
+        log_var_param: optional learnable log-variance Parameter expanded to batch shape.
+    """
+    if mean_dec_z is not None:
+        mean_pz = mean_dec_z(samples_s)
+    else:
+        mean_pz = torch.zeros(samples_s.shape[0], z_dim, device=samples_s.device, dtype=samples_s.dtype)
+
+    if log_var_param is not None:
+        log_var_pz = log_var_param.expand_as(mean_pz)
+    else:
+        log_var_pz = torch.zeros_like(mean_pz)
+
     log_var_pz = torch.clamp(log_var_pz, -15.0, 15.0)
     return mean_pz, log_var_pz

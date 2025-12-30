@@ -359,7 +359,7 @@ def _counterfactual_search(
     normalized, noisy = _apply_normalization(x_list, types_list, normalization_params)
 
     with torch.no_grad():
-        _samples, q_params = model.encoder(noisy, tau=args.tau_min)
+        _samples, q_params = model.encoder(noisy, tau=args.tau_min, deterministic_s=True)
 
     base_pred = int(clf.predict(scaler.transform(x.reshape(1, -1)))[0])
     target_label = 1 - base_pred

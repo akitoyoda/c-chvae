@@ -29,15 +29,22 @@ class CHVAEModel(nn.Module):
             self.encoder = Encoder.Encoder(input_dims, z_dim, s_dim)
 
         self.decoder = Decoder.Decoder(types_list, self.y_dim_partition, z_dim)
-        self.prior_layer = nn.Linear(s_dim, z_dim)
+        self.mean_dec_z = nn.Linear(s_dim, z_dim)
+        # Initialize log-variance to zero (unit variance) and let training adapt it.
         self.prior_logvar = nn.Parameter(torch.zeros(1, z_dim))
+        self._init_weights()
+
+    def _init_weights(self):
+        with torch.no_grad():
+            self.mean_dec_z.weight.normal_(0.0, 0.05)
+            if self.mean_dec_z.bias is not None:
+                self.mean_dec_z.bias.zero_()
 
     def forward(self, x_list, tau, x_list_c=None):
         normalized_data, normalization_params, noisy_data = Helpers.batch_normalization(x_list, self.types_list, len(x_list[0]))
         samples, q_params = self.encoder(noisy_data, tau, x_list_c)
         samples_s = samples['s']
-        mean_pz = self.prior_layer(samples_s)
-        log_var_pz = self.prior_logvar.expand_as(mean_pz)
+        mean_pz, log_var_pz = Encoder.z_distribution_GMM(samples_s, self.z_dim, self.mean_dec_z, self.prior_logvar)
         p_params = {'z': (mean_pz, log_var_pz)}
 
         theta, decoder_samples, gradient_decoder = self.decoder(samples['z'])
@@ -67,12 +74,15 @@ class CHVAEModel(nn.Module):
     def generate(self, x_list, tau=1e-3, x_list_c=None):
         self.eval()
         normalized_data, normalization_params, noisy_data = Helpers.batch_normalization(x_list, self.types_list, len(x_list[0]))
-        samples, q_params = self.encoder(noisy_data, tau, x_list_c)
+        samples, q_params = self.encoder(noisy_data, tau, x_list_c, deterministic_s=True)
+        mean_pz, log_var_pz = Encoder.z_distribution_GMM(samples['s'], self.z_dim, self.mean_dec_z, self.prior_logvar)
+        p_params = {'z': (mean_pz, log_var_pz)}
         theta, decoder_samples = self.decoder.decode_only(samples['z'])
         log_p_x, samples_x, params_x = Evaluation.loglik_evaluation(normalized_data, self.types_list, theta, normalization_params)
         return {
             'samples': {**decoder_samples, 's': samples['s'], 'x': samples_x},
             'q_params': q_params,
+            'p_params': p_params,
             'theta': theta,
             'log_p_x': log_p_x,
             'params_x': params_x,

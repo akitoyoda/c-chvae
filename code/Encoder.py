@@ -25,11 +25,19 @@ class BaseEncoder(nn.Module):
 
     def _init_weights(self):
         with torch.no_grad():
-            for module in self.modules():
-                if isinstance(module, nn.Linear):
-                    module.weight.normal_(0.0, 0.05)
-                    if module.bias is not None:
-                        module.bias.zero_()
+            self.s_layer.weight.normal_(0.0, 0.05)
+            if self.s_layer.bias is not None:
+                self.s_layer.bias.zero_()
+
+            for layer in self.z_mean_layers:
+                layer.weight.normal_(0.0, 0.05)
+                if layer.bias is not None:
+                    layer.bias.zero_()
+
+            for layer in self.z_logvar_layers:
+                layer.weight.normal_(0.0, 0.05)
+                if layer.bias is not None:
+                    layer.bias.zero_()
 
     def forward(self, x_list, tau, x_cond_list=None, deterministic_s=False):
         device = x_list[0].device

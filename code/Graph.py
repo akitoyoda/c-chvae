@@ -30,7 +30,8 @@ class CHVAEModel(nn.Module):
 
         self.decoder = Decoder.Decoder(types_list, self.y_dim_partition, z_dim)
         self.mean_dec_z = nn.Linear(s_dim, z_dim)
-        self.prior_logvar = nn.Parameter(torch.zeros(1, z_dim))  # start from unit variance prior as in TF baseline
+        # Initialize log-variance to zero (unit variance), matching the original TensorFlow setup.
+        self.prior_logvar = nn.Parameter(torch.zeros(1, z_dim))
         self._init_weights()
 
     def _init_weights(self):

@@ -18,8 +18,10 @@ def y_partition(samples_y, types_list, y_dim_partition):
 class Decoder(nn.Module):
     def __init__(self, types_list, y_dim_partition, z_dim, seed=None):
         super().__init__()
+        generator = None
         if seed is not None:
-            torch.manual_seed(seed)
+            generator = torch.Generator()
+            generator.manual_seed(seed)
         self.types_list = types_list
         self.y_dim_partition = y_dim_partition
         self.y_layer = nn.Linear(z_dim, int(np.sum(y_dim_partition)))
@@ -51,7 +53,10 @@ class Decoder(nn.Module):
 
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=0.05)
+                if generator is None:
+                    nn.init.normal_(module.weight, mean=0.0, std=0.05)
+                else:
+                    module.weight.normal_(0.0, 0.05, generator=generator)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 

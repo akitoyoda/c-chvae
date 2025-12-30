@@ -53,12 +53,9 @@ class Decoder(nn.Module):
 
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                if generator is None:
-                    nn.init.normal_(module.weight, mean=0.0, std=0.05)
-                else:
-                    module.weight.normal_(0.0, 0.05, generator=generator)
+                module.weight.normal_(0.0, 0.05, generator=generator)
                 if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+                    module.bias.zero_()
 
     def forward(self, samples_z):
         samples = {'z': samples_z, 'y': None, 'x': None, 's': None}

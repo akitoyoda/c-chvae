@@ -29,32 +29,34 @@ class Decoder(nn.Module):
         layers = []
         for idx, t in enumerate(types_list):
             dim = int(t['dim'])
-            if t['type'] in ['real', 'pos']:
+            t_type = str(t['type']).strip()
+            if t_type in ['real', 'pos']:
                 layers.append(nn.ModuleDict({
                     'mean': nn.Linear(y_dim_partition[idx], dim),
                     'sigma': nn.Linear(y_dim_partition[idx], dim)
                 }))
-            elif t['type'] == 'count':
+            elif t_type == 'count':
                 layers.append(nn.ModuleDict({
                     'lambda': nn.Linear(y_dim_partition[idx], dim)
                 }))
-            elif t['type'] == 'cat':
+            elif t_type == 'cat':
                 layers.append(nn.ModuleDict({
                     'log_pi': nn.Linear(y_dim_partition[idx], dim - 1)
                 }))
-            elif t['type'] == 'ordinal':
+            elif t_type == 'ordinal':
                 layers.append(nn.ModuleDict({
                     'theta': nn.Linear(y_dim_partition[idx], dim - 1),
                     'mean': nn.Linear(y_dim_partition[idx], 1)
                 }))
             else:
-                raise ValueError(f"Unknown type {t['type']}")
+                raise ValueError(f"Unknown type {t_type}")
         self.type_layers = nn.ModuleList(layers)
 
+        init_generator = generator
         with torch.no_grad():
             for module in self.modules():
                 if isinstance(module, nn.Linear):
-                    module.weight.normal_(0.0, 0.05, generator=generator)
+                    module.weight.normal_(0.0, 0.05, generator=init_generator)
                     if module.bias is not None:
                         module.bias.zero_()
 

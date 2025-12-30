@@ -16,8 +16,10 @@ def y_partition(samples_y, types_list, y_dim_partition):
 
 
 class Decoder(nn.Module):
-    def __init__(self, types_list, y_dim_partition, z_dim):
+    def __init__(self, types_list, y_dim_partition, z_dim, seed=None):
         super().__init__()
+        if seed is not None:
+            torch.manual_seed(seed)
         self.types_list = types_list
         self.y_dim_partition = y_dim_partition
         self.y_layer = nn.Linear(z_dim, int(np.sum(y_dim_partition)))
@@ -46,6 +48,12 @@ class Decoder(nn.Module):
             else:
                 raise ValueError(f"Unknown type {t['type']}")
         self.type_layers = nn.ModuleList(layers)
+
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.05)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(self, samples_z):
         samples = {'z': samples_z, 'y': None, 'x': None, 's': None}

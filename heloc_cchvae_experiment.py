@@ -278,7 +278,7 @@ def _encode_z_mean(
     else:
         x_list_c_in = x_list_c
 
-    _samples, q_params = model.encoder(noisy_free, tau=tau, x_list_c=x_list_c_in)
+    _samples, q_params = model.encoder(noisy_free, tau=tau, x_list_c=x_list_c_in, deterministic_s=True)
     z = q_params["z"][0].detach().cpu().numpy()  # (N, z_dim)
     return z
 
@@ -317,7 +317,7 @@ def _counterfactual_search_cchvae(
     normalized_free, noisy_free = _apply_normalization(x_list, types_list, normalization_params_free)
 
     with torch.no_grad():
-        _samples, q_params = model.encoder(noisy_free, tau=args.tau_min, x_list_c=x_list_c_1)
+        _samples, q_params = model.encoder(noisy_free, tau=args.tau_min, x_list_c=x_list_c_1, deterministic_s=True)
     z_base = q_params["z"][0].detach().cpu().numpy()  # (1, z_dim)
 
     normalization_params_np = _loglik_params_to_numpy(normalization_params_free)

@@ -51,11 +51,12 @@ class Decoder(nn.Module):
                 raise ValueError(f"Unknown type {t['type']}")
         self.type_layers = nn.ModuleList(layers)
 
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                module.weight.normal_(0.0, 0.05, generator=generator)
-                if module.bias is not None:
-                    module.bias.zero_()
+        with torch.no_grad():
+            for module in self.modules():
+                if isinstance(module, nn.Linear):
+                    module.weight.normal_(0.0, 0.05, generator=generator)
+                    if module.bias is not None:
+                        module.bias.zero_()
 
     def forward(self, samples_z):
         samples = {'z': samples_z, 'y': None, 'x': None, 's': None}

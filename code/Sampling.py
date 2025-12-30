@@ -98,7 +98,7 @@ def sampling(settings, types_dict, types_dict_c, out, ncounterfactuals, clf, n_b
 
     with torch.no_grad():
         normalized_data, normalization_params, noisy_data = Helpers.batch_normalization(X_list, types_dict, test_batch.shape[0])
-        samples, q_params = model.encoder(noisy_data, tau, X_list_c)
+        samples, q_params = model.encoder(noisy_data, tau, X_list_c, deterministic_s=True)
         z_total_test = q_params['z'][0].cpu().numpy()
         theta, _ = model.decoder.decode_only(samples['z'])
         log_p_x, samples_total_test, test_params_x = Evaluation.loglik_evaluation(normalized_data, types_dict, theta, normalization_params)

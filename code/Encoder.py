@@ -21,7 +21,17 @@ class BaseEncoder(nn.Module):
             self.z_mean_layers.append(nn.Linear(in_dim, z_dim))
             self.z_logvar_layers.append(nn.Linear(in_dim, z_dim))
 
-    def forward(self, x_list, tau, x_cond_list=None):
+        self._init_weights()
+
+    def _init_weights(self):
+        with torch.no_grad():
+            for module in self.modules():
+                if isinstance(module, nn.Linear):
+                    module.weight.normal_(0.0, 0.05)
+                    if module.bias is not None:
+                        module.bias.zero_()
+
+    def forward(self, x_list, tau, x_cond_list=None, deterministic_s=False):
         device = x_list[0].device
         batch_size = x_list[0].shape[0]
 
@@ -33,7 +43,10 @@ class BaseEncoder(nn.Module):
             x_cond = None
 
         log_pi = self.s_layer(x)
-        samples_s = F.gumbel_softmax(log_pi, tau=tau, hard=False, dim=1)
+        if deterministic_s:
+            samples_s = F.one_hot(torch.argmax(log_pi, dim=1), num_classes=self.s_dim).type_as(log_pi)
+        else:
+            samples_s = F.gumbel_softmax(log_pi, tau=tau, hard=False, dim=1)
 
         mean_qz = []
         log_var_qz = []
@@ -75,8 +88,16 @@ class ConditionalEncoder(BaseEncoder):
         super().__init__(input_dims, z_dim, s_dim, include_condition=True, condition_dim=sum(condition_dims))
 
 
-def z_distribution_GMM(samples_s, z_dim):
-    mean_pz = torch.zeros(samples_s.shape[0], z_dim, device=samples_s.device, dtype=samples_s.dtype)
-    log_var_pz = torch.zeros_like(mean_pz)
+def z_distribution_GMM(samples_s, z_dim, mean_dec_z=None, log_var_param=None):
+    if mean_dec_z is not None:
+        mean_pz = mean_dec_z(samples_s)
+    else:
+        mean_pz = torch.zeros(samples_s.shape[0], z_dim, device=samples_s.device, dtype=samples_s.dtype)
+
+    if log_var_param is not None:
+        log_var_pz = log_var_param.expand_as(mean_pz)
+    else:
+        log_var_pz = torch.zeros_like(mean_pz)
+
     log_var_pz = torch.clamp(log_var_pz, -15.0, 15.0)
     return mean_pz, log_var_pz

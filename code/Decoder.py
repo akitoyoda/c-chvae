@@ -15,6 +15,10 @@ def y_partition(samples_y, types_list, y_dim_partition):
     return grouped
 
 
+def _normalize_type_label(value):
+    return str(value).strip()
+
+
 class Decoder(nn.Module):
     def __init__(self, types_list, y_dim_partition, z_dim, seed=None):
         super().__init__()
@@ -29,7 +33,7 @@ class Decoder(nn.Module):
         layers = []
         for idx, t in enumerate(types_list):
             dim = int(t['dim'])
-            t_type = str(t['type']).strip()  # normalize potential CSV whitespace
+            t_type = _normalize_type_label(t['type'])  # normalize potential CSV whitespace
             if t_type in ['real', 'pos']:
                 layers.append(nn.ModuleDict({
                     'mean': nn.Linear(y_dim_partition[idx], dim),

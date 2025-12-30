@@ -40,6 +40,13 @@ class BaseEncoder(nn.Module):
                     layer.bias.zero_()
 
     def forward(self, x_list, tau, x_cond_list=None, deterministic_s=False):
+        """
+        Args:
+            x_list: list of tensors for each variable.
+            tau: temperature for Gumbel-Softmax during training.
+            x_cond_list: optional conditioning inputs.
+            deterministic_s: when True, sample s as one-hot argmax(log_pi) for inference/visualization.
+        """
         device = x_list[0].device
         batch_size = x_list[0].shape[0]
 
@@ -97,6 +104,15 @@ class ConditionalEncoder(BaseEncoder):
 
 
 def z_distribution_GMM(samples_s, z_dim, mean_dec_z=None, log_var_param=None):
+    """
+    Compute the Gaussian parameters for p(z|s).
+
+    Args:
+        samples_s: one-hot or soft samples from q(s|x).
+        z_dim: latent dimensionality.
+        mean_dec_z: optional nn.Linear mapping s -> mean; if None, defaults to zeros.
+        log_var_param: optional learnable log-variance Parameter expanded to batch shape.
+    """
     if mean_dec_z is not None:
         mean_pz = mean_dec_z(samples_s)
     else:

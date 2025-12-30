@@ -57,11 +57,15 @@ class Decoder(nn.Module):
         self.type_layers = nn.ModuleList(layers)
 
         with torch.no_grad():
-            for module in self.modules():
-                if isinstance(module, nn.Linear):
-                    module.weight.normal_(0.0, 0.05, generator=generator)
-                    if module.bias is not None:
-                        module.bias.zero_()
+            self.y_layer.weight.normal_(0.0, 0.05, generator=generator)
+            if self.y_layer.bias is not None:
+                self.y_layer.bias.zero_()
+
+            for layer_group in self.type_layers:
+                for layer in layer_group.values():
+                    layer.weight.normal_(0.0, 0.05, generator=generator)
+                    if layer.bias is not None:
+                        layer.bias.zero_()
 
     def forward(self, samples_z):
         samples = {'z': samples_z, 'y': None, 'x': None, 's': None}

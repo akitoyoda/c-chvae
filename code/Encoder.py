@@ -59,7 +59,8 @@ class BaseEncoder(nn.Module):
 
         log_pi = self.s_layer(x)
         if deterministic_s:
-            samples_s = F.one_hot(torch.argmax(log_pi, dim=1), num_classes=self.s_dim).to(log_pi.dtype)
+            indices = torch.argmax(log_pi, dim=1, keepdim=True)
+            samples_s = torch.zeros_like(log_pi).scatter_(1, indices, 1.0)
         else:
             samples_s = F.gumbel_softmax(log_pi, tau=tau, hard=False, dim=1)
 

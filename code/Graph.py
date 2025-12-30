@@ -48,7 +48,6 @@ class CHVAEModel(nn.Module):
         p_params = {'z': (mean_pz, log_var_pz)}
 
         theta, decoder_samples, gradient_decoder = self.decoder(samples['z'])
-        decoder_samples['s'] = samples_s
 
         log_p_x, samples_x, params_x = Evaluation.loglik_evaluation(normalized_data, self.types_list, theta, normalization_params)
         p_params['x'] = params_x

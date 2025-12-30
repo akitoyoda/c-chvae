@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 
 class BaseEncoder(nn.Module):
@@ -39,7 +40,10 @@ class BaseEncoder(nn.Module):
                 if layer.bias is not None:
                     layer.bias.zero_()
 
-    def forward(self, x_list, tau, x_cond_list=None, deterministic_s=False):
+    def forward(self, x_list, tau, x_cond_list=None, x_list_c=None, deterministic_s=False):
+        # Support both `x_cond_list` and legacy `x_list_c` keyword names used elsewhere
+        if x_cond_list is None and x_list_c is not None:
+            x_cond_list = x_list_c
         """
         Args:
             x_list: list of tensors for each variable.
@@ -71,6 +75,7 @@ class BaseEncoder(nn.Module):
             if self.include_condition and x_cond is not None:
                 pieces.append(x_cond)
             inp = torch.cat(pieces, dim=1)
+
             mean_qz.append(self.z_mean_layers[idx](inp))
             log_var_qz.append(self.z_logvar_layers[idx](inp))
 
@@ -79,11 +84,32 @@ class BaseEncoder(nn.Module):
         log_var_qz.append(prior_log_var)
         mean_qz.append(prior_mean)
 
+        # Sanitize mean/logvar tensors to prevent NaN/Inf propagation
+        sanitized_mean_qz = []
+        sanitized_log_var_qz = []
+        for mm, lv in zip(mean_qz, log_var_qz):
+            # replace NaN/Inf in means; clip extreme values
+            mm_clean = torch.nan_to_num(mm, nan=0.0, posinf=1e6, neginf=-1e6)
+            mm_clean = torch.clamp(mm_clean, min=-1e6, max=1e6)
+            # replace NaN/Inf in logvars; clamp to reasonable range
+            lv_clean = torch.nan_to_num(lv, nan=0.0, posinf=50.0, neginf=-50.0)
+            lv_clean = torch.clamp(lv_clean, min=-50.0, max=50.0)
+            sanitized_mean_qz.append(mm_clean)
+            sanitized_log_var_qz.append(lv_clean)
+
+        mean_qz = sanitized_mean_qz
+        log_var_qz = sanitized_log_var_qz
+
         log_var_stack = torch.stack(log_var_qz, dim=0)
         mean_stack = torch.stack(mean_qz, dim=0)
 
-        log_var_joint = -torch.logsumexp(-log_var_stack, dim=0)
-        mean_joint = torch.exp(log_var_joint) * torch.sum(mean_stack * torch.exp(-log_var_stack), dim=0)
+        # Numerically stable computation of mixture mean/variance using normalized weights
+        # weights = softmax(-log_var_stack) across mixture components
+        neg = -log_var_stack
+        denom = torch.logsumexp(neg, dim=0)
+        weights = torch.exp(neg - denom)  # stable, sums to 1 across components
+        mean_joint = torch.sum(mean_stack * weights, dim=0)
+        log_var_joint = -denom
 
         eps = torch.randn_like(mean_joint)
         samples_z = mean_joint + torch.exp(0.5 * log_var_joint) * eps

@@ -97,19 +97,20 @@ class Decoder(nn.Module):
 
         theta = []
         for idx, t in enumerate(self.types_list):
+            t_type = _normalize_type_label(t['type'])
             out_layers = self.type_layers[idx]
-            if t['type'] == 'real':
+            if t_type == 'real':
                 theta.append([out_layers['mean'](grouped_samples_y[idx]),
                               out_layers['sigma'](grouped_samples_y[idx])])
-            elif t['type'] == 'pos':
+            elif t_type == 'pos':
                 theta.append([out_layers['mean'](grouped_samples_y[idx]),
                               out_layers['sigma'](grouped_samples_y[idx])])
-            elif t['type'] == 'count':
+            elif t_type == 'count':
                 theta.append(out_layers['lambda'](grouped_samples_y[idx]))
-            elif t['type'] == 'cat':
+            elif t_type == 'cat':
                 logits = out_layers['log_pi'](grouped_samples_y[idx])
                 theta.append(torch.cat([torch.zeros(samples_z.size(0), 1, device=samples_z.device, dtype=samples_z.dtype), logits], dim=1))
-            elif t['type'] == 'ordinal':
+            elif t_type == 'ordinal':
                 theta.append([out_layers['theta'](grouped_samples_y[idx]),
                               out_layers['mean'](grouped_samples_y[idx])])
         return theta, samples

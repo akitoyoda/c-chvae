@@ -5,13 +5,13 @@ weight structures (e.g., the output of ``model.get_weights()`` or any nested
 TensorFlow structure), compute the weighted Federated Averaging result.
 """
 
-from typing import Iterable, Sequence
+from typing import Any, Sequence
 
 import tensorflow as tf
 
 
 def fedavg(
-    client_weights: Sequence[Iterable],
+    client_weights: Sequence[Sequence[Any]],
     client_sizes: Sequence[float] | None = None,
 ):
     """
@@ -45,12 +45,14 @@ def fedavg(
     total_examples = tf.add_n(client_sizes)
 
     def _average_one_layer(*layer_values):
+        if not layer_values:
+            raise ValueError("Each client weight structure must contain tensors/arrays")
         # layer_values contains the same layer from each client.
         # Keep dtype consistent with the first value.
         dtype = tf.dtypes.as_dtype(getattr(layer_values[0], "dtype", tf.float32))
+        cast_sizes = tuple(tf.cast(size, dtype) for size in client_sizes)
         weighted = [
-            tf.cast(value, dtype) * tf.cast(client_sizes[idx], dtype)
-            for idx, value in enumerate(layer_values)
+            tf.cast(value, dtype) * cast_sizes[idx] for idx, value in enumerate(layer_values)
         ]
         return tf.math.add_n(weighted) / tf.cast(total_examples, dtype)
 
